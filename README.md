@@ -71,15 +71,18 @@ What to export is set at the top of `citibike-ride-costs.js`:
 | `LOOKBACK_DAYS`       | `365`   | how far back to fetch |
 | `PRICE_CAP_CENTS`     | `365`   | the hypothetical per-ride cap ($3.65) |
 
-How rides are fetched is set inside `fetchAllRides()`, in the "Fetching" section
-at the bottom of the file:
+How rides are fetched is set in the `collectByTimeWindows({ … })` call in the
+run steps:
 
-| constant              | default | what it does |
-|-----------------------|---------|--------------|
-| `WINDOW_DAYS`         | `4`     | date span per lookup window |
-| `WINDOWS_PER_REQUEST` | `30`    | windows asked for in one request; lower it if requests start failing as "too complex" |
-| `MAX_REQUESTS`        | `100`   | safety stop |
-| `PAUSE_MS`            | `300`   | pause between requests, to be polite |
+| option        | default      | what it does |
+|---------------|--------------|--------------|
+| `windowMs`    | 4 days       | date span per lookup window |
+| `batchSize`   | `30`         | windows asked for in one request; lower it if requests start failing as "too complex" |
+| `maxAttempts` | `3`          | tries per window before it's reported as failed |
+| `maxRequests` | `100`        | safety stop |
+| `pauseMs`     | `300`        | pause between requests, to be polite |
+
+The request timeout (45 s) is in `fetchRidePages()`.
 
 ## How fetching works
 

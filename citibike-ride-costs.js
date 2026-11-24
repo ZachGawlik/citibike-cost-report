@@ -8,7 +8,7 @@
 // sends GraphQL queries to the same endpoint the ride-history page itself uses.
 //
 // What it does in your browser:
-//   - Network: fetchAllRides(), in the "Fetching" section at the bottom, is the only
+//   - Network: fetchRidePages(), in the "Citi Bike requests" section, is the only
 //     code that sends requests, all of them POSTs to /bikesharefe-gql on this same
 //     site, using your existing login. Nothing is sent anywhere else.
 //   - Page: nothing changes. It doesn't read or write cookies, localStorage or any
@@ -16,9 +16,12 @@
 //   - Console: progress lines, the totals table, and the `citibikeRides` variable
 //     (which holds the CSV text).
 //
-// Layout: settings and helpers, then the cost math and report, then the run steps.
-// How rides are fetched is kept separate, at the bottom; the rest of the code only
-// relies on fetchAllRides() returning the rides in the period.
+// Layout, top to bottom:
+//   1. Settings, helpers, cost math and report, then the run steps.
+//   2. Citi Bike requests: the one place that knows the endpoint, the query and the
+//      response fields.
+//   3. Batching: generic paging logic with no network code and no Citi Bike
+//      knowledge; it only calls the functions it's handed.
 
 (async () => {
   // ── Settings ────────────────────────────────────────────────────────────────────
@@ -98,7 +101,18 @@
   const periodEnd = Date.now();
   const periodStart = periodEnd - LOOKBACK_DAYS * MS_PER_DAY;
 
-  const { rides, requestCount, failedWindows } = await fetchAllRides(periodStart, periodEnd);
+  const { items: rides, requestCount, failedWindows } = await collectByTimeWindows({
+    start: periodStart,
+    end: periodEnd,
+    fetchPages: fetchRidePages,
+    timeOf: (ride) => Number(ride.startTimeMs),
+    idOf: (ride) => ride.rideId,
+    windowMs: 4 * MS_PER_DAY, // span per window (aim: < 10 rides each, one page)
+    batchSize: 30,            // windows asked for in one request
+    maxAttempts: 3,           // per window, then it's reported as failed
+    maxRequests: 100,         // safety stop; a normal year needs ~5–10
+    pauseMs: 300,             // between requests, to be polite
+  });
   const rows = rides.sort((a, b) => a.startTimeMs - b.startTimeMs).map(toRow); // oldest first
   const summary = summarize(rows);
   printReport(summary, requestCount, failedWindows);
@@ -107,130 +121,133 @@
   // copy() is a DevTools console helper: it only works when typed at the prompt.
   console.log('To copy the rides as CSV to your clipboard, run:  copy(citibikeRides.csv)');
 
-  // ── Fetching ────────────────────────────────────────────────────────────────────
-  //
-  // Everything about talking to the server lives in fetchAllRides(), including its
-  // own settings. It returns:
-  //   rides          every ride that started in [periodStart, periodEnd), each once:
-  //                  { rideId, startTimeMs, duration, price: { formatted } }
-  //   requestCount   how many requests it sent
-  //   failedWindows  date ranges it gave up on (their rides are missing)
-  //
-  // How it works:
-  //   - The server returns rides newest-first, 10 per page, for "rides that started
-  //     before <startTimeMs>". There is no page-size option.
-  //   - The period is cut into 4-day windows. Each window starts its own page at the
-  //     window's end time.
-  //   - Up to 30 windows are asked for in one request (GraphQL aliases r0, r1, …).
-  //   - A window whose page came back full, without reaching the window's start, is
-  //     queued again from its oldest ride, so busy windows take extra lookups.
-  //
-  // (A function declaration, so the Run steps above can call it before this point.)
-  async function fetchAllRides(periodStart, periodEnd) {
-    const ENDPOINT = '/bikesharefe-gql';        // the ride-history page's own GraphQL endpoint
-    const WINDOW_DAYS = 4;                      // time span per window (aim: < 10 rides each)
-    const WINDOWS_PER_REQUEST = 30;             // windows asked for in one request
-    const MAX_ATTEMPTS_PER_WINDOW = 3;          // then the window is reported as failed
-    const MAX_REQUESTS = 100;                   // safety stop; a normal year needs ~5–10
-    const PAUSE_MS = 300;                       // between requests, to be polite
-    const TIMEOUT_MS = 45_000;                  // give up on a request after this long
+  // The two sections below are function declarations, so the run steps above can
+  // call them before they appear.
 
+  // ── Citi Bike requests ──────────────────────────────────────────────────────────
+  //
+  // The server returns rides newest-first, 10 per page, for "rides that started
+  // before <startTimeMs>". There is no page-size option, so one request asks for
+  // several pages at once, one per start time, as GraphQL aliases r0, r1, …
+
+  /**
+   * Fetches one page of rides before each of `cursorsMs`. Returns one entry per
+   * cursor: { items: rides, full: whether more rides follow }, or null if the server
+   * errored on just that page. Throws if the whole request failed.
+   */
+  async function fetchRidePages(cursorsMs) {
+    const ENDPOINT = '/bikesharefe-gql'; // the ride-history page's own GraphQL endpoint
+    const TIMEOUT_MS = 45_000;           // give up on a request after this long
+
+    const indexes = cursorsMs.map((_, i) => i);
+    const query = `query (${indexes.map((i) => `$cursor${i}: String`).join(', ')}) {
+      member {
+        ${indexes.map((i) => `r${i}: rideHistory(startTimeMs: $cursor${i}) {
+          limit hasMore
+          rideHistoryList { rideId startTimeMs duration price { formatted } }
+        }`).join('\n')}
+      }
+    }`;
+    const variables = Object.fromEntries(cursorsMs.map((ms, i) => [`cursor${i}`, String(ms)]));
+
+    const response = await fetch(ENDPOINT, {
+      method: 'POST',
+      credentials: 'include', // send the logged-in session cookies
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+      headers: { 'content-type': 'application/json', 'Apollo-Require-Preflight': 'true' },
+      body: JSON.stringify({ query, variables }),
+    });
+    const body = await response.json().catch(() => {
+      throw new Error(`HTTP ${response.status}, response wasn't JSON`);
+    });
+    const member = body.data?.member;
+    if (!member) throw new Error(`GraphQL error: ${body.errors?.[0]?.message}`);
+
+    return indexes.map((i) => {
+      const page = member[`r${i}`];
+      if (!page) return null;
+      const rides = page.rideHistoryList;
+      return { items: rides, full: page.hasMore && rides.length >= page.limit };
+    });
+  }
+
+  // ── Batching (generic) ──────────────────────────────────────────────────────────
+  //
+  // Collects every item whose time is in [start, end) from a source that pages
+  // newest-first by "items before time T". No network code and nothing Citi Bike
+  // specific: it only calls the functions it's handed.
+  //
+  //   - [start, end) is cut into windows of `windowMs`; each window's first page
+  //     starts at the window's end.
+  //   - `batchSize` windows' pages are asked for in one fetchPages() call.
+  //   - A full page that hasn't reached back to its window's start gets a follow-up
+  //     page from its oldest item.
+  //   - A failing window is retried up to `maxAttempts` times, then reported in
+  //     `failedWindows`. After `maxRequests` calls, unfinished windows are reported
+  //     there too.
+  //
+  // Returns { items (each once, by idOf), requestCount, failedWindows }.
+  async function collectByTimeWindows({
+    start, end, fetchPages, timeOf, idOf, windowMs, batchSize, maxAttempts, maxRequests, pauseMs,
+  }) {
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const day = (ms) => new Date(ms).toISOString().slice(0, 10);
 
-    /** One query asking for one page per window, as aliases r0, r1, … */
-    function buildQuery(windowCount) {
-      const indexes = [...Array(windowCount).keys()];
-      return `query (${indexes.map((i) => `$cursor${i}: String`).join(', ')}) {
-        member {
-          ${indexes.map((i) => `r${i}: rideHistory(startTimeMs: $cursor${i}) {
-            limit hasMore
-            rideHistoryList { rideId startTimeMs duration price { formatted } }
-          }`).join('\n')}
-        }
-      }`;
-    }
-
-    /**
-     * Fetches one page per window. pages[i] belongs to windows[i], and is null if the
-     * server errored on just that window. Throws if the whole request failed.
-     */
-    async function fetchPages(windows) {
-      const variables = Object.fromEntries(windows.map((w, i) => [`cursor${i}`, String(w.cursorMs)]));
-      const response = await fetch(ENDPOINT, {
-        method: 'POST',
-        credentials: 'include', // send the logged-in session cookies
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-        headers: { 'content-type': 'application/json', 'Apollo-Require-Preflight': 'true' },
-        body: JSON.stringify({ query: buildQuery(windows.length), variables }),
-      });
-      const body = await response.json().catch(() => {
-        throw new Error(`HTTP ${response.status}, response wasn't JSON`);
-      });
-      const member = body.data?.member;
-      if (!member) throw new Error(`GraphQL error: ${body.errors?.[0]?.message}`);
-      return windows.map((_, i) => member[`r${i}`] ?? null);
-    }
-
-    // A window covers [startMs, endMs); cursorMs is where its next page starts.
+    // A window covers [startMs, end of window); cursorMs is where its next page starts.
     const queue = [];
-    for (let endMs = periodEnd; endMs > periodStart; endMs -= WINDOW_DAYS * MS_PER_DAY) {
-      const startMs = Math.max(periodStart, endMs - WINDOW_DAYS * MS_PER_DAY);
-      queue.push({ startMs, cursorMs: endMs, attempts: 0 });
+    for (let windowEnd = end; windowEnd > start; windowEnd -= windowMs) {
+      queue.push({ startMs: Math.max(start, windowEnd - windowMs), cursorMs: windowEnd, attempts: 0 });
     }
-    const rides = new Map(); // rideId → ride; the same ride seen twice is stored once
+    const items = new Map(); // idOf(item) → item; the same item seen twice is stored once
     const failedWindows = [];
     let requestCount = 0;
 
     function retryOrGiveUp(window, reason) {
       window.attempts += 1;
-      if (window.attempts < MAX_ATTEMPTS_PER_WINDOW) {
+      if (window.attempts < maxAttempts) {
         queue.unshift(window);
       } else {
-        console.warn(`✗ giving up on window from ${formatDateTime(window.startMs)}: ${reason}`);
+        console.warn(`✗ giving up on window from ${day(window.startMs)}: ${reason}`);
         failedWindows.push({ ...window, reason });
       }
     }
 
     while (queue.length > 0) {
-      if (requestCount >= MAX_REQUESTS) {
+      if (requestCount >= maxRequests) {
         // Keep what was fetched; report the unfinished windows instead of throwing.
-        failedWindows.push(...queue.splice(0).map((w) => ({ ...w, reason: `hit ${MAX_REQUESTS}-request limit` })));
+        failedWindows.push(...queue.splice(0).map((w) => ({ ...w, reason: `hit ${maxRequests}-request limit` })));
         break;
       }
-      const batch = queue.splice(0, WINDOWS_PER_REQUEST);
+      const batch = queue.splice(0, batchSize);
       requestCount += 1;
-      console.log(`request ${requestCount}: ${batch.length} windows, ${rides.size} rides so far`);
+      console.log(`request ${requestCount}: ${batch.length} windows, ${items.size} items so far`);
 
       let pages;
       try {
-        pages = await fetchPages(batch);
+        pages = await fetchPages(batch.map((window) => window.cursorMs));
       } catch (error) {
         console.warn(`↻ request failed, retrying: ${error.message}`);
         batch.forEach((window) => retryOrGiveUp(window, error.message));
-        await sleep(PAUSE_MS);
+        await sleep(pauseMs);
         continue;
       }
 
       batch.forEach((window, i) => {
         const page = pages[i];
-        if (page === null) return retryOrGiveUp(window, 'GraphQL error for this window');
+        if (page === null) return retryOrGiveUp(window, 'error for this window');
 
-        const startTimes = page.rideHistoryList.map((ride) => Number(ride.startTimeMs));
-        for (const ride of page.rideHistoryList) {
-          const startMs = Number(ride.startTimeMs);
-          if (startMs >= periodStart && startMs < periodEnd) rides.set(ride.rideId, ride);
-        }
+        const times = page.items.map(timeOf);
+        page.items.forEach((item, j) => {
+          if (times[j] >= start && times[j] < end) items.set(idOf(item), item);
+        });
 
-        // A full page that hasn't reached back to the window's start means there are
-        // more rides in this window: queue another page starting at the oldest ride.
-        const oldestMs = Math.min(...startTimes);
-        const pageWasFull = page.hasMore && startTimes.length >= page.limit;
-        if (pageWasFull && oldestMs > window.startMs && oldestMs < window.cursorMs) {
-          queue.push({ startMs: window.startMs, cursorMs: oldestMs, attempts: 0 });
+        const oldest = Math.min(...times);
+        if (page.full && oldest > window.startMs && oldest < window.cursorMs) {
+          queue.push({ startMs: window.startMs, cursorMs: oldest, attempts: 0 });
         }
       });
-      await sleep(PAUSE_MS);
+      await sleep(pauseMs);
     }
-    return { rides: [...rides.values()], requestCount, failedWindows };
+    return { items: [...items.values()], requestCount, failedWindows };
   }
 })();
