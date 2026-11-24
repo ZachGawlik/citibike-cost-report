@@ -1,32 +1,18 @@
 // Citi Bike ride-cost export.
 //
 // Paste this whole file into the DevTools console on
-// https://account.citibikenyc.com/ride-history while logged in. It fetches every ride
-// from the last 365 days, prints monthly totals (actual, and what they would be with a
-// per-ride price cap), and leaves the rides as CSV in `citibikeRides.csv`; run
-// `copy(citibikeRides.csv)` afterwards to put it on the clipboard. Read-only: it only
-// sends GraphQL queries to the same endpoint the ride-history page itself uses.
+// https://account.citibikenyc.com/ride-history while logged in.
+// It fetches your every ride from the last 365 days and prints monthly totals
+// before and after the upcoming $3.65 price capping.
+// You can opt to then manually copy a csv of your individual ride data.
 //
-// What it does in your browser:
-//   - Network: fetchRidePages(), in the "Citi Bike requests" section, is the only
-//     code that sends requests, all of them POSTs to /bikesharefe-gql on this same
-//     site, using your existing login. Nothing is sent anywhere else.
-//   - Page: nothing changes. It doesn't read or write cookies, localStorage or any
-//     other browser storage.
-//   - Console: progress lines, the totals table, and the `citibikeRides` variable
-//     (which holds the CSV text).
-//
-// Layout, top to bottom:
-//   1. Settings, helpers, cost math and report, then the run steps.
-//   2. Citi Bike requests: the one place that knows the endpoint, the query and the
-//      response fields.
-//   3. Batching: generic paging logic with no network code and no Citi Bike
-//      knowledge; it only calls the functions it's handed.
+// Read-only: it only sends GraphQL queries to the same endpoint the ride-history page itself uses.
+// There are no reads or alterations from the page itself.
 
 (async () => {
   // ── Settings ────────────────────────────────────────────────────────────────────
   const LOOKBACK_DAYS = 365;                    // rides that started within this many days
-  const PRICE_CAP_CENTS = 365;                  // hypothetical per-ride ceiling: $3.65
+  const PRICE_CAP_CENTS = 365;                  // upcoming ride fare cap, https://citibikenyc.com/memberebikecap
   const TIME_ZONE = 'America/New_York';         // for ride times and month grouping
   const MS_PER_DAY = 86_400_000;
 
@@ -128,11 +114,8 @@
   printReport(summary, requestCount, failedWindows);
 
   globalThis.citibikeRides = { rows, csv: toCsv(rows), ...summary, requestCount, failedWindows };
-  // copy() is a DevTools console helper: it only works when typed at the prompt.
   console.log('To copy the rides as CSV to your clipboard, run:  copy(citibikeRides.csv)');
 
-  // The two sections below are function declarations, so the run steps above can
-  // call them before they appear.
 
   // ── Citi Bike requests ──────────────────────────────────────────────────────────
   //
