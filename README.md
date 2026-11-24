@@ -1,115 +1,88 @@
 # Citi Bike ride-cost export
 
-A browser console snippet that pulls every Citi Bike ride from the last 365
-days out of your account, prints monthly cost totals, and gets the rides ready
-to copy as CSV. It also shows what you would have paid if every ride were capped at
-$3.65, and how much that cap would have saved.
+Get a list of every Citi Bike ride you took in the last 365 days, with monthly
+cost totals. It also works out what you'd have paid if every ride had been
+capped at $3.65, and how much that cap would have saved you.
 
-There's no public API for your own ride history, so the snippet runs inside
-the logged-in account page and asks the same private GraphQL endpoint that
-the page itself uses. It only reads data; it changes nothing on your account.
+It's a short script that you paste into your browser while you're logged in to
+your Citi Bike account. Citi Bike doesn't offer a download of your ride
+history, so the script asks for it the same way the "Ride history" page does.
 
-## Usage
+## Is it safe?
+
+The script only *reads* your ride history. It can't change your account, make
+payments or send your data anywhere.
+
+- It only talks to Citi Bike's own website, using the login you already have.
+- It doesn't change the page or save anything in your browser.
+- Everything it finds is shown in the browser console, and stays there until
+  you close the tab.
+
+You don't have to take that on trust: the top of `citibike-ride-costs.js`
+explains what it does in plain terms, and the part that contacts Citi Bike is
+one short, clearly labelled function. As with any script you paste into a
+browser, it's worth a quick read first.
+
+## How to use it
 
 1. Log in at <https://account.citibikenyc.com/ride-history>.
-2. Open your browser's DevTools console.
-3. Paste the whole of `citibike-ride-costs.js` and press Enter.
-   - The first time, Chrome blocks pasting and asks you to type
-     `allow pasting` first. Firefox does the same with `allow pasting`.
-4. Wait a few seconds. You'll see one `request N: …` line per request
-   (around 5–10 for a typical year), then the results.
-5. To get the rides as CSV, run `copy(citibikeRides.csv)` in the same
-   console and paste into a spreadsheet or file. (`copy()` is a DevTools
-   helper, so it has to be typed at the console prompt.)
+2. Open your browser's DevTools console. In most browsers: right-click
+   anywhere on the page → **Inspect** → the **Console** tab.
+3. Copy the whole of `citibike-ride-costs.js`, paste it into the console and
+   press Enter.
+   - The first time, Chrome and Firefox block pasting and ask you to type
+     `allow pasting` first. That's a general safety warning about pasting
+     code, which is why the "Is it safe?" section above is worth a read.
+4. Wait a few seconds while it fetches your rides. You'll see a few
+   `request …` lines, then a table of results.
+5. To get the full list of rides, type `copy(citibikeRides.csv)` into the
+   console and press Enter. That puts it on your clipboard as CSV, which you
+   can paste into a spreadsheet (Google Sheets, Excel, Numbers).
 
 ## What you get
 
-**A table in the console**, one row per month plus a `total` row:
+**A table** with one row per month, plus a `total` row at the bottom:
 
-| column         | meaning                                         |
-|----------------|-------------------------------------------------|
-| `rides`        | rides that started in that month                |
-| `total`        | what you actually paid                          |
-| `rides > $3.65`| rides that cost more than the cap               |
-| `capped total` | what you'd have paid with every ride capped     |
-| `saved`        | `total` − `capped total`                        |
+| column          | meaning                                          |
+|-----------------|--------------------------------------------------|
+| `rides`         | how many rides started that month                |
+| `total`         | what you actually paid                           |
+| `rides > $3.65` | how many rides cost more than $3.65              |
+| `capped total`  | what you'd have paid if no ride cost over $3.65  |
+| `saved`         | the difference between the two                   |
 
-The first and last months are partial, since the period is exactly the last
-365 days rather than calendar months.
+The first and last months only cover part of the month, because the period is
+exactly the last 365 days.
 
-**CSV text** in `citibikeRides.csv` (copy it with `copy(citibikeRides.csv)`),
-one row per ride, oldest first:
+**The ride list** (from `copy(citibikeRides.csv)`), one ride per line, oldest
+first:
 
-| column        | example               |
-|---------------|-----------------------|
-| `start`       | `2026-11-20 16:27:14` (New York time) |
-| `minutes`     | `6`                   |
-| `cents`       | `176`                 |
-| `cappedCents` | `176`                 |
-
-**A console global**, `citibikeRides`, holding the CSV, the rows and the
-totals, for poking at further (e.g. `citibikeRides.total`).
+| column        | example               | meaning                          |
+|---------------|-----------------------|----------------------------------|
+| `start`       | `2026-11-20 16:27:14` | when the ride started (New York time) |
+| `minutes`     | `6`                   | how long it lasted               |
+| `cents`       | `176`                 | what it cost, in cents ($1.76)   |
+| `cappedCents` | `176`                 | what it would cost with the cap  |
 
 ## If something goes wrong
 
-- **`✗ INCOMPLETE: N windows failed`** — some date ranges kept erroring after
-  3 tries (or the 100-request safety stop was hit). The totals and CSV cover
-  everything else, but are missing those rides. Running it again usually
-  fixes a transient failure.
-- **`↻ request failed, retrying: …` on every request** — usually an expired
-  session. Reload the page, log in again, and re-run.
-- **`unexpected price format: …`** — Citi Bike changed how prices look (or a
-  ride cost $1,000+). The snippet stops rather than guess, so totals can't be
-  silently wrong; `parseCents` would need updating.
+- **Every line says `↻ request failed, retrying`** — you've most likely been
+  logged out. Reload the page, log in again and paste the script again.
+- **It ends with `✗ INCOMPLETE`** — Citi Bike's site didn't answer for some
+  dates, so a few rides are missing from the totals. Running it again usually
+  fixes this.
+- **It stops with `unexpected price format`** — Citi Bike has changed how
+  prices are shown, and the script stops rather than risk wrong totals. It
+  needs a small update before it will work again.
 
-## Settings
+## Changing the cap or the time period
 
-What to export is set at the top of `citibike-ride-costs.js`:
+Near the top of `citibike-ride-costs.js`, under "Settings", you can edit two
+numbers before pasting:
 
-| constant              | default | what it does |
-|-----------------------|---------|--------------|
-| `LOOKBACK_DAYS`       | `365`   | how far back to fetch |
-| `PRICE_CAP_CENTS`     | `365`   | the hypothetical per-ride cap ($3.65) |
+- `LOOKBACK_DAYS = 365` — how many days back to look.
+- `PRICE_CAP_CENTS = 365` — the per-ride cap, in cents (`365` means $3.65).
 
-How rides are fetched is set in the `collectByTimeWindows({ … })` call in the
-run steps:
+## Technical details
 
-| option        | default      | what it does |
-|---------------|--------------|--------------|
-| `windowMs`    | 4 days       | date span per lookup window |
-| `batchSize`   | `30`         | windows asked for in one request; lower it if requests start failing as "too complex" |
-| `maxAttempts` | `3`          | tries per window before it's reported as failed |
-| `maxRequests` | `100`        | safety stop |
-| `pauseMs`     | `300`        | pause between requests, to be polite |
-
-The request timeout (45 s) is in `fetchRidePages()`.
-
-## How fetching works
-
-The server returns rides newest first, 10 per page, for "rides that started
-before time T". There's no way to ask for bigger pages, and the server rejects
-introspection and batched requests.
-
-To avoid one request per 10 rides, the 365 days are cut into 4-day windows,
-and up to 30 windows go into a single GraphQL query as aliases
-(`r0: rideHistory(...)`, `r1: …`). A window whose page comes back full before
-reaching the window's start gets a follow-up lookup from its oldest ride. The
-same ride showing up twice is stored once.
-
-## Tests
-
-`test-ride-costs.mjs` runs the snippet in a Node `vm` against a fake server
-with ~700 synthetic rides, under a few guesses about how the real server
-treats the cursor and with injected failures (timeouts, 502s, windows that
-always error, hitting the request limit). It checks that the exported rides
-and totals match exactly.
-
-```sh
-./test-ride-costs.mjs       # needs zx (npm i -g zx)
-./test-ride-costs.mjs -v    # also show the snippet's console output
-```
-
-## Privacy
-
-The exported CSV is your personal ride history. `*.csv` is git-ignored; keep
-it that way.
+See [DEVELOPMENT.md](DEVELOPMENT.md) for how it fetches rides, its internal settings and the tests.
