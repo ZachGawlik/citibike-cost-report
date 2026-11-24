@@ -109,13 +109,6 @@ function mockFetch({ cursorMode, fault, stats }) {
   };
 }
 
-// The page's SSR first page, for the snippet's self-check.
-const nextData = {
-  props: { pageProps: { apolloState: { 'User:u1': { 'rideHistory({})': {
-    limit: SERVER_DEFAULT_LIMIT, hasMore: true, rideHistoryList: rides.filter((r) => r.startTimeMs < NOW).slice(0, 10),
-  } } } } },
-};
-
 // ── run cases ─────────────────────────────────────────────────────────────────────
 const code = fs.readFileSync(SNIPPET, 'utf8');
 const quiet = { log() {}, warn() {}, table() {}, error() {} };
@@ -129,7 +122,7 @@ for (const { cursorMode, fault } of CASES) {
   const stats = { requests: 0 };
   let downloaded;
   const env = {
-    year: YEAR, now: () => NOW, gapMs: 0, timeoutMs: TEST_TIMEOUT_MS, nextData,
+    year: YEAR, now: () => NOW, gapMs: 0, timeoutMs: TEST_TIMEOUT_MS,
     fetch: mockFetch({ cursorMode, fault, stats }),
     console: argv.v ? console : quiet,
     download: (name, csv) => { downloaded = { name, csv }; },
@@ -149,7 +142,7 @@ for (const { cursorMode, fault } of CASES) {
     const missing = truth.filter((r) => !got.has(r.rideId)).length;
     const extra = res.rows.filter((r) => !truth.some((t) => t.rideId === r.rideId)).length;
     const pageRequests = res.requests;
-    ok = missing === 0 && extra === 0 && res.totalCents === truthCents && res.ssrMissing.length === 0
+    ok = missing === 0 && extra === 0 && res.totalCents === truthCents
       && res.cappedCents === truthCapped && res.savedCents === truthCents - truthCapped
       && pageRequests <= maxRequests && downloaded?.csv.split('\n').length === truth.length + 1;
     detail = `rides ${res.rows.length}/${truth.length}  missing ${missing}  extra ${extra}`

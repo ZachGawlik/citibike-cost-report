@@ -24,6 +24,7 @@
   const MAX_REQUESTS = 1_000;                         // runaway guard (~10,000 rides)
   const PRICE_CAP_CENTS = env.capCents ?? 365;        // hypothetical per-ride price ceiling ($3.65)
   const CSV_LOCALE = 'sv-SE';                         // locale whose format is "YYYY-MM-DD HH:MM:SS"
+  const CSV_COLUMNS = ['rideId', 'start', 'end', 'minutes', 'bike', 'price', 'cents', 'cappedCents', 'amountRaw', 'currency'];
   const MS_PER_MIN = 60_000;
 
   const doFetch = env.fetch ?? globalThis.fetch.bind(globalThis);
@@ -35,8 +36,16 @@
     member { id rideHistory(startTimeMs: $startTimeMs) { limit hasMore rideHistoryList {
       rideId startTimeMs endTimeMs duration rideableName price { amount currency formatted } } } } }`;
 
+  // ── small helpers ───────────────────────────────────────────────────────────────
   const localTime = (ms) => new Date(Number(ms)).toLocaleString(CSV_LOCALE, { timeZone: TIME_ZONE });
+  const dollars = (c) => `$${(c / 100).toFixed(2)}`;
+  const toCents = (formatted) => {
+    const m = /(-)?\$?\s*([\d,]+)\.(\d{2})/.exec(formatted ?? '');
+    if (!m) return null;
+    return (m[1] ? -1 : 1) * (Number(m[2].replace(/,/g, '')) * 100 + Number(m[3]));
+  };
 
+  // ── network ─────────────────────────────────────────────────────────────────────
   // Returns the parsed body ({data, errors}); throws on timeout, HTTP error without
   // a JSON body, or network failure.
   async function gql(variables) {
@@ -82,118 +91,104 @@
     }
   }
 
-  // ── 1. sequential crawl ─────────────────────────────────────────────────────────
-  const yearStart = new Date(YEAR, 0, 1).getTime();
-  const yearEnd = Math.min(new Date(YEAR + 1, 0, 1).getTime(), now());
-  const rides = new Map();
-  let requests = 0;
-  let cursor = yearEnd;
-  globalThis.citibikeRidesPartial = rides;
-
-  for (;;) {
-    if (requests >= MAX_REQUESTS) throw new Error(`gave up after ${MAX_REQUESTS} requests`);
-    requests++;
-    const page = await fetchPage(cursor);
-    const list = page.rideHistoryList ?? [];
-    let oldest = Infinity;
-    for (const r of list) {
-      const t = Number(r.startTimeMs);
-      oldest = Math.min(oldest, t);
-      if (t >= yearStart && t < yearEnd) rides.set(r.rideId, r);
+  // ── step 1: fetch every ride in [yearStart, yearEnd), newest first ──────────────
+  async function crawlYear(yearStart, yearEnd) {
+    const rides = new Map(); // rideId → raw ride; dedupes any page overlap
+    globalThis.citibikeRidesPartial = rides;
+    let requests = 0;
+    let cursor = yearEnd;
+    for (;;) {
+      if (requests >= MAX_REQUESTS) throw new Error(`gave up after ${MAX_REQUESTS} requests`);
+      requests++;
+      const page = await fetchPage(cursor);
+      const list = page.rideHistoryList ?? [];
+      let oldest = Infinity;
+      for (const r of list) {
+        const t = Number(r.startTimeMs);
+        oldest = Math.min(oldest, t);
+        if (t >= yearStart && t < yearEnd) rides.set(r.rideId, r);
+      }
+      log.log(`request ${requests}: ${list.length} rides back to ${list.length ? localTime(oldest) : '—'}`
+        + ` → ${rides.size} in ${YEAR} so far`);
+      if (!list.length || !page.hasMore || oldest < yearStart) break;
+      // Next page starts at this page's oldest ride; dedupe by rideId absorbs any
+      // overlap if the server treats the cursor inclusively.
+      cursor = oldest < cursor ? oldest : cursor - CURSOR_BACKOFF_MS;
+      await sleep(REQUEST_GAP_MS);
     }
-    log.log(`request ${requests}: ${list.length} rides back to ${list.length ? localTime(oldest) : '—'}`
-      + ` → ${rides.size} in ${YEAR} so far`);
-    if (!list.length || !page.hasMore || oldest < yearStart) break;
-    // Next page starts at this page's oldest ride; dedupe by rideId absorbs any
-    // overlap if the server treats the cursor inclusively.
-    cursor = oldest < cursor ? oldest : cursor - CURSOR_BACKOFF_MS;
-    await sleep(REQUEST_GAP_MS);
+    return { rides, requests };
   }
 
-  // ── 2. shape the results ────────────────────────────────────────────────────────
-  const toCents = (formatted) => {
-    const m = /(-)?\$?\s*([\d,]+)\.(\d{2})/.exec(formatted ?? '');
-    if (!m) return null;
-    return (m[1] ? -1 : 1) * (Number(m[2].replace(/,/g, '')) * 100 + Number(m[3]));
-  };
-
-  const rows = [...rides.values()]
-    .sort((a, b) => Number(b.startTimeMs) - Number(a.startTimeMs))
-    .map((r) => ({
-      rideId: r.rideId,
-      start: localTime(r.startTimeMs),
-      end: localTime(r.endTimeMs),
-      minutes: Math.round(Number(r.duration) / MS_PER_MIN),
-      bike: r.rideableName,
-      price: r.price?.formatted ?? '',
-      cents: toCents(r.price?.formatted),
-      cappedCents: Math.min(toCents(r.price?.formatted) ?? 0, PRICE_CAP_CENTS),
-      amountRaw: r.price?.amount ?? '',
-      currency: r.price?.currency ?? '',
-    }));
-
-  const unparsed = rows.filter((r) => r.cents === null);
-  const totalCents = rows.reduce((s, r) => s + (r.cents ?? 0), 0);
-  const cappedCents = rows.reduce((s, r) => s + r.cappedCents, 0);
-  const overCap = rows.filter((r) => r.cents > PRICE_CAP_CENTS).length;
-  const dollars = (c) => `$${(c / 100).toFixed(2)}`;
-
-  // Per-month rows plus a YEAR row, each with the actual total, the total if every
-  // ride were capped at PRICE_CAP_CENTS, and the difference saved.
-  const capLabel = dollars(PRICE_CAP_CENTS);
-  const bucket = () => ({ rides: 0, minutes: 0, cents: 0, capped: 0, over: 0, free: 0 });
-  const months = {};
-  const year = bucket();
-  for (const r of rows) {
-    for (const m of [(months[r.start.slice(0, 7)] ??= bucket()), year]) {
-      m.rides++; m.minutes += r.minutes; m.cents += r.cents ?? 0; m.capped += r.cappedCents;
-      if (r.cents > PRICE_CAP_CENTS) m.over++;
-      if (r.cents === 0) m.free++;
-    }
+  // ── step 2: raw rides → flat rows (newest first), with capped price ─────────────
+  function toRows(rides) {
+    return [...rides.values()]
+      .sort((a, b) => Number(b.startTimeMs) - Number(a.startTimeMs))
+      .map((r) => {
+        const cents = toCents(r.price?.formatted);
+        return {
+          rideId: r.rideId,
+          start: localTime(r.startTimeMs),
+          end: localTime(r.endTimeMs),
+          minutes: Math.round(Number(r.duration) / MS_PER_MIN),
+          bike: r.rideableName,
+          price: r.price?.formatted ?? '',
+          cents,
+          cappedCents: Math.min(cents ?? 0, PRICE_CAP_CENTS),
+          amountRaw: r.price?.amount ?? '',
+          currency: r.price?.currency ?? '',
+        };
+      });
   }
-  const tableRow = (m) => ({
-    rides: m.rides, free: m.free, minutes: m.minutes, total: dollars(m.cents),
-    [`rides > ${capLabel}`]: m.over, 'capped total': dollars(m.capped), saved: dollars(m.cents - m.capped),
-  });
-  const monthTable = Object.fromEntries(Object.entries(months).sort().map(([k, m]) => [k, tableRow(m)]));
-  monthTable[`${YEAR} total`] = tableRow(year); // non-numeric key, so console.table lists it last
 
-  // ── 3. self-check against the 10 rides the page server-rendered ────────────────
-  let ssr = [];
-  try {
-    const nd = env.nextData ?? JSON.parse(document.getElementById('__NEXT_DATA__').textContent);
-    for (const v of Object.values(nd.props.pageProps.apolloState)) {
-      const l = v?.['rideHistory({})']?.rideHistoryList;
-      if (l) { ssr = l; break; }
+  // ── step 3: per-month and whole-year totals, actual vs capped ───────────────────
+  function summarize(rows) {
+    const bucket = () => ({ rides: 0, minutes: 0, cents: 0, capped: 0, over: 0, free: 0 });
+    const months = {};
+    const year = bucket();
+    for (const r of rows) {
+      for (const m of [(months[r.start.slice(0, 7)] ??= bucket()), year]) {
+        m.rides++; m.minutes += r.minutes; m.cents += r.cents ?? 0; m.capped += r.cappedCents;
+        if (r.cents > PRICE_CAP_CENTS) m.over++;
+        if (r.cents === 0) m.free++;
+      }
     }
-  } catch { /* not on the ride-history page; skip */ }
-  const ssrInYear = ssr.filter((r) => Number(r.startTimeMs) >= yearStart && Number(r.startTimeMs) < yearEnd);
-  const ssrMissing = ssrInYear.filter((r) =>
-    rides.get(r.rideId)?.price?.formatted !== r.price?.formatted);
+    return { months, year, unparsed: rows.filter((r) => r.cents === null) };
+  }
 
-  // ── 4. report + CSV ─────────────────────────────────────────────────────────────
-  log.table(monthTable);
-  log.log([
-    `${YEAR}: ${rows.length} rides, total ${dollars(totalCents)}`,
-    `with a ${capLabel}/ride cap: ${dollars(cappedCents)}, saving ${dollars(totalCents - cappedCents)}`
-      + ` across ${overCap} rides over the cap`,
-    `requests: ${requests} for ${rows.length} rides`,
-    ssr.length
-      ? (ssrMissing.length
-        ? `✗ self-check: ${ssrMissing.length}/${ssrInYear.length} server-rendered rides missing or mismatched`
-        : `✓ self-check: all ${ssrInYear.length} server-rendered rides from this year found with matching prices`)
-      : '· self-check skipped (no __NEXT_DATA__)',
-    unparsed.length ? `✗ ${unparsed.length} prices could not be parsed: ${unparsed.map((r) => r.price).join(', ')}` : '',
-  ].filter(Boolean).join('\n'));
+  function monthTable({ months, year }) {
+    const capLabel = dollars(PRICE_CAP_CENTS);
+    const tableRow = (m) => ({
+      rides: m.rides, free: m.free, minutes: m.minutes, total: dollars(m.cents),
+      [`rides > ${capLabel}`]: m.over, 'capped total': dollars(m.capped), saved: dollars(m.cents - m.capped),
+    });
+    const table = Object.fromEntries(Object.entries(months).sort().map(([k, m]) => [k, tableRow(m)]));
+    table[`${YEAR} total`] = tableRow(year); // non-numeric key, so console.table lists it last
+    return table;
+  }
 
-  const cols = ['rideId', 'start', 'end', 'minutes', 'bike', 'price', 'cents', 'cappedCents', 'amountRaw', 'currency'];
-  const esc = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v ?? ''));
-  const csv = [cols.join(','), ...rows.map((r) => cols.map((c) => esc(r[c])).join(','))].join('\n');
-  const today = new Date().toLocaleDateString(CSV_LOCALE, { timeZone: TIME_ZONE });
-  const filename = `${today}-citibike-rides-${YEAR}.csv`;
+  // ── step 4: console report ──────────────────────────────────────────────────────
+  function report({ rows, summary, requests }) {
+    const { year, unparsed } = summary;
+    log.table(monthTable(summary));
+    log.log([
+      `${YEAR}: ${rows.length} rides, total ${dollars(year.cents)}`,
+      `with a ${dollars(PRICE_CAP_CENTS)}/ride cap: ${dollars(year.capped)}, saving ${dollars(year.cents - year.capped)}`
+        + ` across ${year.over} rides over the cap`,
+      `requests: ${requests} for ${rows.length} rides`,
+      unparsed.length ? `✗ ${unparsed.length} prices could not be parsed: ${unparsed.map((r) => r.price).join(', ')}` : '',
+    ].filter(Boolean).join('\n'));
+  }
 
-  if (env.download) env.download(filename, csv);
-  else {
+  // ── step 5: CSV download ────────────────────────────────────────────────────────
+  function toCsv(rows) {
+    const esc = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v ?? ''));
+    return [CSV_COLUMNS.join(','), ...rows.map((r) => CSV_COLUMNS.map((c) => esc(r[c])).join(','))].join('\n');
+  }
+
+  function download(csv) {
+    const today = new Date().toLocaleDateString(CSV_LOCALE, { timeZone: TIME_ZONE });
+    const filename = `${today}-citibike-rides-${YEAR}.csv`;
+    if (env.download) return env.download(filename, csv);
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
     a.download = filename;
@@ -201,9 +196,21 @@
     URL.revokeObjectURL(a.href);
   }
 
+  // ── main ────────────────────────────────────────────────────────────────────────
+  const yearStart = new Date(YEAR, 0, 1).getTime();
+  const yearEnd = Math.min(new Date(YEAR + 1, 0, 1).getTime(), now());
+
+  const { rides, requests } = await crawlYear(yearStart, yearEnd);
+  const rows = toRows(rides);
+  const summary = summarize(rows);
+  report({ rows, summary, requests });
+  const csv = toCsv(rows);
+  download(csv);
+
+  const { cents: totalCents, capped: cappedCents, over: overCap } = summary.year;
   const result = {
     year: YEAR, rows, totalCents, cappedCents, savedCents: totalCents - cappedCents, overCap,
-    requests, ssrMissing, csv,
+    requests, csv,
   };
   globalThis.citibikeRides = result;
   return result;
