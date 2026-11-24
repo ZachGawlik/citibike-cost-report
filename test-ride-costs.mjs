@@ -8,7 +8,7 @@ const HELP = `usage: test-ride-costs.mjs [-v]
 Runs citibike-ride-costs.js in a vm against a fake /bikesharefe-gql server with
 synthetic rides, and checks the exported rides and totals exactly match.
 
-Cases vary what we can't observe directly:
+Cases vary what can't be observed on the real server:
   cursor semantics  exclusive (<), inclusive (<=), fuzzy (< cursor + 30s)
   faults            hangOnce    first request never answers (snippet must time out)
                     http502     every 3rd request is a bad gateway with an HTML body
