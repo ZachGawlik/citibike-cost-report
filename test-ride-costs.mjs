@@ -13,11 +13,11 @@ const BURST_RIDES = 37;
 const SERVER_DEFAULT_LIMIT = 10;                    // real server's page size
 const FUZZ_MS = 30_000;                             // "fuzzy" cursor variant: includes rides up to cursor+30s
 const SEED = 42;
-const ALIAS_CAP = 12;                               // sizeCap/hang faults: max aliases the mock tolerates
-const PARTIAL_BEFORE = new Date(2026, 3, 1).getTime(); // partial fault: older cursors fail on first try
-const DEAD_CURSOR_MONTH = '2026-05-';               // deadWindow fault: cursors in this month always fail
+const CAP_CENTS = 365;                              // must match the snippet's PRICE_CAP_CENTS default
+const FLAKY_BEFORE = new Date(2026, 3, 1).getTime(); // nullOnce/hangOnce: cursors older than this fail on first try
+const DEAD_CURSOR_MONTH = '2026-05-';               // deadPage fault: cursors in this month always fail
 const HTTP502_EVERY = 3;                            // http502 fault: every Nth request is a bad gateway
-const TEST_TIMEOUT_MS = 50;                         // snippet request timeout during tests (hang fault)
+const TEST_TIMEOUT_MS = 50;                         // snippet request timeout during tests (hangOnce fault)
 const MS_PER_DAY = 86_400_000;
 const MS_PER_MIN = 60_000;
 
@@ -26,15 +26,15 @@ const HELP = `usage: test-ride-costs.mjs [-v]
 
 Runs citibike-ride-costs.js in a vm against mock /bikesharefe-gql servers.
 The mock data is synthetic: random rides from Dec 2025 plus a ${BURST_RIDES}-ride burst day.
-Each case checks that the exported ride set and total exactly match the truth.
+Each case checks the exported ride set, total, capped total, and that the request
+count stays within one request per ${SERVER_DEFAULT_LIMIT - 1} rides (+1).
 
 Server variants cover what we can't observe directly:
   cursor semantics: exclusive (<), inclusive (<=), fuzzy (< cursor+30s)
-  faults: sizeCap  (HTTP 400 above ${ALIAS_CAP} aliases)
-          hang     (no response above ${ALIAS_CAP} aliases)
-          http502  (every ${HTTP502_EVERY}rd request, HTML body)
-          partial  (some aliases null on first try)
-          deadWindow (one month always fails: must be reported, not hidden)
+  faults: hangOnce  (older pages hang on first try)
+          http502   (every ${HTTP502_EVERY}rd request, HTML body)
+          nullOnce  (older pages return null + GraphQL error on first try)
+          deadPage  (pages in one month always fail: run must stop loudly)
 
   -v   show the snippet's own console output`;
 
@@ -69,27 +69,23 @@ rides.sort((a, b) => b.startTimeMs - a.startTimeMs);
 const yearStart = new Date(YEAR, 0, 1).getTime();
 const truth = rides.filter((r) => r.startTimeMs >= yearStart && r.startTimeMs < NOW);
 const truthCents = truth.reduce((s, r) => s + r.price.amount, 0);
-const CAP_CENTS = 365;                           // must match the snippet's PRICE_CAP_CENTS default
 const truthCapped = truth.reduce((s, r) => s + Math.min(r.price.amount, CAP_CENTS), 0);
+const maxRequests = Math.ceil(truth.length / (SERVER_DEFAULT_LIMIT - 1)) + 1; // inclusive cursor repeats 1/page
 
 // ── mock server ───────────────────────────────────────────────────────────────────
 const json = (body, status = 200) => ({ ok: status < 400, status, json: async () => body });
 const dayOf = (ms) => new Date(ms).toLocaleDateString('sv-SE', { timeZone: 'America/New_York' });
+const hang = (signal) => new Promise((_, rej) => signal.addEventListener('abort', () => rej(new Error('aborted'))));
+const nullPage = () => json({ data: { member: { id: 'u1', rideHistory: null } }, errors: [{ message: 'Internal server error' }] });
 
-// Whole-request faults; returning a value short-circuits the normal response.
+// Faults; returning a value short-circuits the normal response.
 const FAULTS = {
-  sizeCap: ({ n }) => (n > ALIAS_CAP ? json({ errors: [{ message: 'Query is too complex' }] }, 400) : null),
-  hang: ({ n, signal }) => (n > ALIAS_CAP
-    ? new Promise((_, rej) => signal.addEventListener('abort', () => rej(new Error('aborted'))))
-    : null),
+  hangOnce: ({ cursor, seen, signal }) => (cursor < FLAKY_BEFORE && !seen.has(cursor) && seen.add(cursor) ? hang(signal) : null),
   http502: ({ stats }) => (stats.requests % HTTP502_EVERY === 0
     ? { ok: false, status: 502, json: async () => { throw new SyntaxError('Unexpected token <'); } }
     : null),
-};
-// Per-alias faults: true nulls out that alias and adds an error entry.
-const ALIAS_FAULTS = {
-  partial: (cursor, seen) => cursor < PARTIAL_BEFORE && !seen.has(cursor) && Boolean(seen.add(cursor)),
-  deadWindow: (cursor) => dayOf(cursor).startsWith(DEAD_CURSOR_MONTH),
+  nullOnce: ({ cursor, seen }) => (cursor < FLAKY_BEFORE && !seen.has(cursor) && seen.add(cursor) ? nullPage() : null),
+  deadPage: ({ cursor }) => (dayOf(cursor).startsWith(DEAD_CURSOR_MONTH) ? nullPage() : null),
 };
 
 function mockFetch({ cursorMode, fault, stats }) {
@@ -101,30 +97,15 @@ function mockFetch({ cursorMode, fault, stats }) {
   const seen = new Set();
   return async (url, opts) => {
     stats.requests++;
-    const { query, variables } = JSON.parse(opts.body);
-    if (/limit:/.test(query)) {
-      return json({ errors: [{ message: 'Unknown argument "limit" on field "User.rideHistory".' }] }, 400);
-    }
-    const n = Object.keys(variables).length;
-    const short = FAULTS[fault]?.({ n, signal: opts.signal, stats });
+    const { variables } = JSON.parse(opts.body);
+    const cursor = variables.startTimeMs == null ? Infinity : Number(variables.startTimeMs);
+    const short = FAULTS[fault]?.({ cursor, seen, signal: opts.signal, stats });
     if (short) return short;
-    const member = { __typename: 'User', id: 'u1' };
-    const errors = [];
-    for (const [k, v] of Object.entries(variables)) {
-      const alias = `r${k.slice(1)}`;
-      const cursor = v === null ? Infinity : Number(v);
-      if (ALIAS_FAULTS[fault]?.(cursor, seen)) {
-        member[alias] = null;
-        errors.push({ message: 'Internal server error', path: ['member', alias] });
-        continue;
-      }
-      const matching = rides.filter((r) => before(Number(r.startTimeMs), cursor));
-      member[alias] = {
-        limit: SERVER_DEFAULT_LIMIT, hasMore: matching.length > SERVER_DEFAULT_LIMIT,
-        rideHistoryList: matching.slice(0, SERVER_DEFAULT_LIMIT),
-      };
-    }
-    return json(errors.length ? { data: { member }, errors } : { data: { member } });
+    const matching = rides.filter((r) => before(Number(r.startTimeMs), cursor));
+    return json({ data: { member: { __typename: 'User', id: 'u1', rideHistory: {
+      limit: SERVER_DEFAULT_LIMIT, hasMore: matching.length > SERVER_DEFAULT_LIMIT,
+      rideHistoryList: matching.slice(0, SERVER_DEFAULT_LIMIT),
+    } } } });
   };
 }
 
@@ -137,11 +118,10 @@ const nextData = {
 
 // ── run cases ─────────────────────────────────────────────────────────────────────
 const code = fs.readFileSync(SNIPPET, 'utf8');
-const quiet = { log() {}, warn() {}, table() {} };
-const sandbox = { setTimeout, clearTimeout, AbortController, URL, console };
+const quiet = { log() {}, warn() {}, table() {}, error() {} };
 const CASES = [
   ...['exclusive', 'inclusive', 'fuzzy'].map((cursorMode) => ({ cursorMode, fault: 'none' })),
-  ...['sizeCap', 'hang', 'http502', 'partial', 'deadWindow'].map((fault) => ({ cursorMode: 'exclusive', fault })),
+  ...['hangOnce', 'http502', 'nullOnce', 'deadPage'].map((fault) => ({ cursorMode: 'exclusive', fault })),
 ];
 let failures = 0;
 
@@ -154,27 +134,31 @@ for (const { cursorMode, fault } of CASES) {
     console: argv.v ? console : quiet,
     download: (name, csv) => { downloaded = { name, csv }; },
   };
-  const res = await vm.runInNewContext(code, { ...sandbox, __CITIBIKE_ENV__: env });
-  const got = new Set(res.rows.map((r) => r.rideId));
-  const missingRides = truth.filter((r) => !got.has(r.rideId));
-  const extra = res.rows.filter((r) => !truth.some((t) => t.rideId === r.rideId)).length;
-  let ok;
-  if (fault === 'deadWindow') {
-    // Expected: those windows are reported failed, and every missing ride falls inside one.
-    const inFailed = (t) => res.failed.some((w) => t >= w.floor && t < w.cursor);
-    ok = res.failed.length > 0 && extra === 0 && missingRides.every((r) => inFailed(Number(r.startTimeMs)));
+  const sandbox = { setTimeout, clearTimeout, AbortController, URL, console: argv.v ? console : quiet, __CITIBIKE_ENV__: env };
+  let res, err;
+  try { res = await vm.runInNewContext(code, sandbox); } catch (e) { err = e; }
+
+  let ok, detail;
+  if (fault === 'deadPage') {
+    // Expected: the run stops with an error naming the failed page; no silent partial export.
+    const partial = sandbox.citibikeRidesPartial;
+    ok = Boolean(err) && /failed 3×/.test(err.message) && !downloaded && partial?.size > 0;
+    detail = `stopped: ${err ? err.message.slice(0, 60) : 'NO ERROR'}  partial ${partial?.size ?? 0} rides`;
   } else {
-    ok = missingRides.length === 0 && extra === 0 && res.totalCents === truthCents && res.failed.length === 0
+    const got = new Set(res.rows.map((r) => r.rideId));
+    const missing = truth.filter((r) => !got.has(r.rideId)).length;
+    const extra = res.rows.filter((r) => !truth.some((t) => t.rideId === r.rideId)).length;
+    const pageRequests = res.requests;
+    ok = missing === 0 && extra === 0 && res.totalCents === truthCents && res.ssrMissing.length === 0
       && res.cappedCents === truthCapped && res.savedCents === truthCents - truthCapped
-      && res.ssrMissing.length === 0 && downloaded?.csv.split('\n').length === truth.length + 1;
+      && pageRequests <= maxRequests && downloaded?.csv.split('\n').length === truth.length + 1;
+    detail = `rides ${res.rows.length}/${truth.length}  missing ${missing}  extra ${extra}`
+      + `  pages ${pageRequests} (≤${maxRequests})  http ${stats.requests}`;
   }
   if (!ok) failures++;
-  echo(`${ok ? '✓ PASS' : '✗ FAIL'}  cursor ${cursorMode.padEnd(9)}  fault ${fault.padEnd(10)}`
-    + `  rides ${String(res.rows.length).padStart(3)}/${truth.length}  missing ${String(missingRides.length).padStart(2)}`
-    + `  extra ${extra}  failed windows ${String(res.failed.length).padStart(2)}  requests ${stats.requests}`);
+  echo(`${ok ? '✓ PASS' : '✗ FAIL'}  cursor ${cursorMode.padEnd(9)}  fault ${fault.padEnd(8)}  ${detail}`);
 }
-const seq = Math.ceil(truth.length / SERVER_DEFAULT_LIMIT);
 echo(failures
   ? `\n✗ ${failures} case(s) failed`
-  : `\n✓ all cases pass (${truth.length} rides, $${(truthCents / 100).toFixed(2)}, capped $${(truthCapped / 100).toFixed(2)}; page-by-page would need ~${seq} requests)`);
+  : `\n✓ all cases pass (${truth.length} rides, $${(truthCents / 100).toFixed(2)}, capped $${(truthCapped / 100).toFixed(2)})`);
 process.exit(failures ? 1 : 0);
