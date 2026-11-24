@@ -1,268 +1,411 @@
-// Citi Bike: export the last 365 days of ride costs to CSV. Paste into the DevTools
-// console on https://account.citibikenyc.com/ride-history while logged in.
+// Citi Bike ride-cost export.
 //
-// Fetching: the server pages by time ("rides before startTimeMs", 10 at a time, no
-// page-size arg). To cut round trips, the period is split into WINDOW_DAYS windows and
-// one cursor per window goes into a single GraphQL request as field aliases
-// (r0..rN); a window only gets a follow-up lookup if its page filled before
-// reaching the window's start.
+// Paste this whole file into the DevTools console on
+// https://account.citibikenyc.com/ride-history while logged in. It fetches every ride
+// from the last 365 days, prints monthly totals (actual, and what they would be with a
+// per-ride price cap), and downloads a CSV. Read-only: it only sends GraphQL queries
+// to the same endpoint the ride-history page itself uses.
 //
-// Monthly/period totals and the price-cap math are computed afterwards from the
-// fetched rides. The result lands in `citibikeRides` (window global), and a CSV is
-// downloaded.
-(async (env = {}) => {
-  // ── tunables ────────────────────────────────────────────────────────────────────
-  const LOOKBACK_DAYS = env.days ?? 365;              // export rides that started within this many days of now
-  const TIME_ZONE = 'America/New_York';               // timestamps in the CSV / month buckets
-  const ENDPOINT = '/bikesharefe-gql';                // same-origin GraphQL endpoint the page uses
-  const WINDOW_DAYS = 4;                              // span per cursor; aim for <10 rides/window
-  const ALIASES_PER_REQUEST = 30;                     // cursors batched into one request
-  const CURSOR_BACKOFF_MS = 30_000;                   // the page's own step, used if no progress
-  const REQUEST_GAP_MS = env.gapMs ?? 300;            // pause between requests (be polite)
-  const REQUEST_TIMEOUT_MS = env.timeoutMs ?? 45_000; // abort a request that hangs this long
-  const RETRY_BACKOFF_MS = env.gapMs ?? 3_000;        // pause after a failed request
-  const MAX_TRIES = 3;                                // attempts per single window before skipping it
-  const MAX_REQUESTS = 600;                           // runaway guard
-  const PRICE_CAP_CENTS = env.capCents ?? 365;        // hypothetical per-ride price ceiling ($3.65)
-  const CSV_LOCALE = 'sv-SE';                         // locale whose format is "YYYY-MM-DD HH:MM:SS"
+// How fetching works:
+//   - The server returns rides newest-first, 10 per page, for "rides that started
+//     before <startTimeMs>". There is no page-size option.
+//   - The 365 days are cut into 4-day windows. Each window starts its own page at the
+//     window's end time.
+//   - Up to 30 windows are asked for in one request (GraphQL aliases r0, r1, …).
+//   - A window whose page came back full, without reaching the window's start, is
+//     queued again from its oldest ride, so busy windows take extra lookups.
+//
+// Results: the console shows a table; `citibikeRides` holds the rows and totals.
+
+(async (testHooks = {}) => {
+  // ── Settings ────────────────────────────────────────────────────────────────────
+
+  // What to export
+  const LOOKBACK_DAYS = testHooks.days ?? 365;           // rides that started within this many days
+  const PRICE_CAP_CENTS = testHooks.capCents ?? 365;     // hypothetical per-ride ceiling: $3.65
+  const TIME_ZONE = 'America/New_York';                  // for printed times and month grouping
+
+  // Server
+  const ENDPOINT = '/bikesharefe-gql';                   // the ride-history page's own GraphQL endpoint
+  const WINDOW_DAYS = 4;                                 // time span per window (aim: < 10 rides each)
+  const WINDOWS_PER_REQUEST = 30;                        // windows asked for in one request
+  const NO_PROGRESS_STEP_MS = 30_000;                    // step back this far if a page doesn't move back in time
+
+  // Politeness and failure handling
+  const PAUSE_BETWEEN_REQUESTS_MS = testHooks.gapMs ?? 300;
+  const PAUSE_AFTER_FAILURE_MS = testHooks.gapMs ?? 3_000;
+  const REQUEST_TIMEOUT_MS = testHooks.timeoutMs ?? 45_000;
+  const MAX_ATTEMPTS_PER_WINDOW = 3;                     // then the window is reported as failed
+  const MAX_REQUESTS = 600;                              // safety stop for a runaway loop
+
+  // Output
+  const DATE_LOCALE = 'sv-SE';                           // this locale formats dates as YYYY-MM-DD HH:MM:SS
   const CSV_COLUMNS = ['rideId', 'start', 'end', 'minutes', 'bike', 'price', 'cents', 'cappedCents', 'amountRaw', 'currency'];
+
+  const MS_PER_MINUTE = 60_000;
   const MS_PER_DAY = 86_400_000;
   const PERIOD_LABEL = `last ${LOOKBACK_DAYS} days`;
-  const MS_PER_MIN = 60_000;
 
-  const doFetch = env.fetch ?? globalThis.fetch.bind(globalThis);
-  const now = env.now ?? Date.now;
-  const log = env.console ?? console;
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Test hooks let test-ride-costs.mjs run this file against a fake server.
+  const fetchFn = testHooks.fetch ?? globalThis.fetch.bind(globalThis);
+  const getNow = testHooks.now ?? Date.now;
+  const log = testHooks.console ?? console;
 
-  const RIDE_FIELDS = `limit hasMore rideHistoryList {
-    rideId startTimeMs endTimeMs duration rideableName price { amount currency formatted } }`;
+  // ── Small helpers ───────────────────────────────────────────────────────────────
 
-  // ── small helpers ───────────────────────────────────────────────────────────────
-  const localTime = (ms) => new Date(Number(ms)).toLocaleString(CSV_LOCALE, { timeZone: TIME_ZONE });
-  const day = (ms) => new Date(ms).toLocaleDateString(CSV_LOCALE, { timeZone: TIME_ZONE });
-  const span = (ws) => `${day(Math.min(...ws.map((w) => w.floor)))}..${day(Math.max(...ws.map((w) => w.cursor)))}`;
-  const dollars = (c) => `$${(c / 100).toFixed(2)}`;
-  const toCents = (formatted) => {
-    const m = /(-)?\$?\s*([\d,]+)\.(\d{2})/.exec(formatted ?? '');
-    if (!m) return null;
-    return (m[1] ? -1 : 1) * (Number(m[2].replace(/,/g, '')) * 100 + Number(m[3]));
-  };
-
-  // ── network ─────────────────────────────────────────────────────────────────────
-  function buildQuery(n) {
-    const vars = Array.from({ length: n }, (_, i) => `$c${i}: String`).join(', ');
-    const fields = Array.from({ length: n }, (_, i) =>
-      `r${i}: rideHistory(startTimeMs: $c${i}) { ${RIDE_FIELDS} }`).join('\n');
-    return `query CitibikeYearRides(${vars}) { member { id\n${fields} } }`;
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  // Returns the parsed body ({data, errors}); throws on timeout, HTTP error without
-  // a JSON body, or network failure.
-  async function gql(query, variables) {
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS);
+  /** "2026-11-20 16:27:14" in New York time. */
+  function formatDateTime(ms) {
+    return new Date(Number(ms)).toLocaleString(DATE_LOCALE, { timeZone: TIME_ZONE });
+  }
+
+  /** "2026-11-20" in New York time. */
+  function formatDate(ms) {
+    return new Date(Number(ms)).toLocaleDateString(DATE_LOCALE, { timeZone: TIME_ZONE });
+  }
+
+  /** 353 → "$3.53" */
+  function formatDollars(cents) {
+    return `$${(cents / 100).toFixed(2)}`;
+  }
+
+  /** "$3.53" → 353, "-$1.00" → -100. Returns null if the text isn't a dollar amount. */
+  function parseCents(priceText) {
+    const match = /(?<minus>-)?\$?\s*(?<dollars>[\d,]+)\.(?<cents>\d{2})/.exec(priceText ?? '');
+    if (!match) return null;
+    const { minus, dollars, cents } = match.groups;
+    const value = Number(dollars.replaceAll(',', '')) * 100 + Number(cents);
+    return minus ? -value : value;
+  }
+
+  /** "2025-11-23..2025-12-03" for a list of windows. */
+  function describeWindows(windows) {
+    const earliest = Math.min(...windows.map((w) => w.startMs));
+    const latest = Math.max(...windows.map((w) => w.cursorMs));
+    return `${formatDate(earliest)}..${formatDate(latest)}`;
+  }
+
+  // ── Talking to the server ───────────────────────────────────────────────────────
+
+  const RIDE_PAGE_FIELDS = `
+    limit
+    hasMore
+    rideHistoryList {
+      rideId startTimeMs endTimeMs duration rideableName
+      price { amount currency formatted }
+    }`;
+
+  /** One query that asks for one page per window, as aliases r0, r1, … */
+  function buildQuery(windowCount) {
+    const variables = [];
+    const fields = [];
+    for (let i = 0; i < windowCount; i++) {
+      variables.push(`$cursor${i}: String`);
+      fields.push(`r${i}: rideHistory(startTimeMs: $cursor${i}) { ${RIDE_PAGE_FIELDS} }`);
+    }
+    return `query CitibikeRidePages(${variables.join(', ')}) {
+      member { id
+        ${fields.join('\n')}
+      }
+    }`;
+  }
+
+  /**
+   * POSTs a GraphQL query and returns the parsed JSON body ({ data, errors }).
+   * Throws on timeout, network failure, or a response that isn't JSON.
+   */
+  async function postGraphQL(query, variables) {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), REQUEST_TIMEOUT_MS);
     try {
-      const res = await doFetch(ENDPOINT, {
+      const response = await fetchFn(ENDPOINT, {
         method: 'POST',
-        credentials: 'include',
-        signal: ctl.signal,
+        credentials: 'include', // send the logged-in session cookies
+        signal: abort.signal,
         headers: { 'content-type': 'application/json', 'Apollo-Require-Preflight': 'true' },
-        body: JSON.stringify({ operationName: 'CitibikeYearRides', query, variables }),
+        body: JSON.stringify({ operationName: 'CitibikeRidePages', query, variables }),
       });
-      let body;
-      try { body = await res.json(); } catch { body = null; }
-      if (!body) throw new Error(`HTTP ${res.status} with no JSON body${res.status === 401 ? ' (logged out?)' : ''}`);
+      const body = await response.json().catch(() => null);
+      if (body === null) {
+        const hint = response.status === 401 ? ' (logged out?)' : '';
+        throw new Error(`HTTP ${response.status} with no JSON body${hint}`);
+      }
       return body;
-    } catch (e) {
-      if (ctl.signal.aborted) throw new Error(`timed out after ${REQUEST_TIMEOUT_MS / 1000}s`);
-      throw e;
+    } catch (error) {
+      if (abort.signal.aborted) throw new Error(`timed out after ${REQUEST_TIMEOUT_MS / 1000}s`);
+      throw error;
     } finally {
       clearTimeout(timer);
     }
   }
 
-  // ── step 1: fetch every ride in [periodStart, periodEnd) via batched windows ───
-  // A failed request (error, timeout, HTTP 4xx/5xx) is split in half and retried,
-  // so one bad window or a server-side size limit can't stall the whole run. A
-  // single window that keeps failing is recorded in `failed` and skipped.
-  async function crawlPeriod(periodStart, periodEnd) {
-    const windowMs = WINDOW_DAYS * MS_PER_DAY;
-    const pending = [];
-    for (let hi = periodEnd; hi > periodStart; hi -= windowMs) {
-      pending.push({ cursor: hi, floor: Math.max(periodStart, hi - windowMs), tries: 0 });
-    }
+  /**
+   * Fetches one page for each window. Returns { pages, errorMessage }, where pages[i]
+   * belongs to windows[i] and is null if the server errored on just that window.
+   * Throws if the whole request failed.
+   */
+  async function fetchPages(windows) {
+    const variables = {};
+    windows.forEach((w, i) => { variables[`cursor${i}`] = String(w.cursorMs); });
 
-    const rides = new Map(); // rideId → raw ride; dedupes any page overlap
-    const failed = [];
-    let requests = 0;
-    let followUps = 0;
-    let batchSize = ALIASES_PER_REQUEST;
-    globalThis.citibikeRidesPartial = { rides, pending, failed };
+    const body = await postGraphQL(buildQuery(windows.length), variables);
+    const errorMessage = body.errors?.map((e) => e.message).join('; ');
+    const member = body.data?.member;
+    if (!member) throw new Error(`GraphQL error: ${errorMessage ?? 'no data'}`);
 
-    const retry = (ws, why) => {
-      if (ws.length > 1) {
-        batchSize = Math.max(1, Math.floor(ws.length / 2));
-        log.warn(`  ↻ ${why} — retrying these ${ws.length} windows in batches of ${batchSize}`);
-        pending.unshift(...ws);
-        return;
-      }
-      const w = ws[0];
-      if (++w.tries < MAX_TRIES) {
-        log.warn(`  ↻ ${why} — window ${span(ws)}, try ${w.tries + 1}/${MAX_TRIES}`);
-        pending.unshift(w);
-      } else {
-        log.warn(`  ✗ ${why} — giving up on window ${span(ws)}`);
-        failed.push({ ...w, why });
-      }
-    };
-
-    while (pending.length) {
-      if (requests >= MAX_REQUESTS) throw new Error(`gave up after ${MAX_REQUESTS} requests`);
-      const batch = pending.splice(0, batchSize);
-      const vars = Object.fromEntries(batch.map((w, i) => [`c${i}`, String(w.cursor)]));
-      requests++;
-      log.log(`request ${requests}: ${batch.length} windows ${span(batch)} …`);
-      let res;
-      try {
-        res = await gql(buildQuery(batch.length), vars);
-      } catch (e) {
-        retry(batch, e.message);
-        await sleep(RETRY_BACKOFF_MS);
-        continue;
-      }
-      if (!res.data?.member) {
-        retry(batch, `GraphQL error: ${res.errors?.map((e) => e.message).join('; ') ?? 'no data'}`);
-        await sleep(RETRY_BACKOFF_MS);
-        continue;
-      }
-      // Partial errors: aliases that errored come back null; requeue just those.
-      const bad = [];
-      batch.forEach((w, i) => {
-        const page = res.data.member[`r${i}`];
-        if (!page) { bad.push(w); return; }
-        const list = page.rideHistoryList ?? [];
-        let oldest = Infinity;
-        for (const r of list) {
-          const t = Number(r.startTimeMs);
-          oldest = Math.min(oldest, t);
-          if (t >= periodStart && t < periodEnd) rides.set(r.rideId, r);
-        }
-        // Window not exhausted: page was full and still hasn't reached the window floor.
-        if (page.hasMore && list.length >= page.limit && oldest > w.floor) {
-          const cursor = oldest < w.cursor ? oldest : w.cursor - CURSOR_BACKOFF_MS;
-          pending.push({ cursor, floor: w.floor, tries: 0 });
-          followUps++;
-        }
-      });
-      if (bad.length) {
-        const why = `GraphQL error: ${res.errors?.[0]?.message ?? 'null result'}`;
-        for (const w of bad) retry([w], why);
-      }
-      log.log(`  → ${rides.size} rides so far, ${pending.length} windows pending`);
-      if (pending.length) await sleep(REQUEST_GAP_MS);
-    }
-    return { rides, requests, followUps, failed };
+    const pages = windows.map((_, i) => member[`r${i}`] ?? null);
+    return { pages, errorMessage: errorMessage ?? 'null result' };
   }
 
-  // ── step 2: raw rides → flat rows (newest first), with capped price ─────────────
+  // ── Step 1: fetch every ride in the period ──────────────────────────────────────
+
+  /**
+   * A window covers [startMs, endMs). `cursorMs` is where its next page starts; it
+   * begins at endMs and moves back as pages come in.
+   */
+  function makeWindows(periodStart, periodEnd) {
+    const windows = [];
+    for (let endMs = periodEnd; endMs > periodStart; endMs -= WINDOW_DAYS * MS_PER_DAY) {
+      const startMs = Math.max(periodStart, endMs - WINDOW_DAYS * MS_PER_DAY);
+      windows.push({ startMs, cursorMs: endMs, attempts: 0 });
+    }
+    return windows;
+  }
+
+  async function fetchAllRides(periodStart, periodEnd) {
+    const rides = new Map(); // rideId → ride; the same ride seen twice is stored once
+    const queue = makeWindows(periodStart, periodEnd);
+    const failedWindows = [];
+    let requestCount = 0;
+    let followUpCount = 0;
+    let batchSize = WINDOWS_PER_REQUEST;
+
+    // If the run stops early, whatever was fetched is still reachable from the console.
+    globalThis.citibikeRidesPartial = { rides, queue, failedWindows };
+
+    // Put a window back at the front of the queue, or give up on it.
+    function retryOrGiveUp(window, reason) {
+      window.attempts += 1;
+      if (window.attempts < MAX_ATTEMPTS_PER_WINDOW) {
+        log.warn(`  ↻ ${reason} — window ${describeWindows([window])}, try ${window.attempts + 1}/${MAX_ATTEMPTS_PER_WINDOW}`);
+        queue.unshift(window);
+      } else {
+        log.warn(`  ✗ ${reason} — giving up on window ${describeWindows([window])}`);
+        failedWindows.push({ ...window, reason });
+      }
+    }
+
+    while (queue.length > 0) {
+      if (requestCount >= MAX_REQUESTS) throw new Error(`gave up after ${MAX_REQUESTS} requests`);
+
+      const batch = queue.splice(0, batchSize);
+      requestCount += 1;
+      log.log(`request ${requestCount}: ${batch.length} windows ${describeWindows(batch)} …`);
+
+      let result;
+      try {
+        result = await fetchPages(batch);
+      } catch (error) {
+        // The whole request failed. A big batch is retried as smaller batches (in case
+        // the server limits query size); a single window counts as a failed attempt.
+        if (batch.length > 1) {
+          batchSize = Math.max(1, Math.floor(batch.length / 2));
+          log.warn(`  ↻ ${error.message} — retrying these ${batch.length} windows in batches of ${batchSize}`);
+          queue.unshift(...batch);
+        } else {
+          retryOrGiveUp(batch[0], error.message);
+        }
+        await sleep(PAUSE_AFTER_FAILURE_MS);
+        continue;
+      }
+
+      for (const [i, window] of batch.entries()) {
+        const page = result.pages[i];
+        if (page === null) {
+          retryOrGiveUp(window, `GraphQL error: ${result.errorMessage}`);
+          continue;
+        }
+
+        const pageRides = page.rideHistoryList ?? [];
+        let oldestMs = Infinity;
+        for (const ride of pageRides) {
+          const startMs = Number(ride.startTimeMs);
+          oldestMs = Math.min(oldestMs, startMs);
+          if (startMs >= periodStart && startMs < periodEnd) rides.set(ride.rideId, ride);
+        }
+
+        // A full page that hasn't reached back to the window's start means there are
+        // more rides in this window: queue another page starting at the oldest ride.
+        const pageWasFull = page.hasMore && pageRides.length >= page.limit;
+        if (pageWasFull && oldestMs > window.startMs) {
+          const movedBack = oldestMs < window.cursorMs;
+          const nextCursor = movedBack ? oldestMs : window.cursorMs - NO_PROGRESS_STEP_MS;
+          queue.push({ startMs: window.startMs, cursorMs: nextCursor, attempts: 0 });
+          followUpCount += 1;
+        }
+      }
+
+      log.log(`  → ${rides.size} rides so far, ${queue.length} windows pending`);
+      if (queue.length > 0) await sleep(PAUSE_BETWEEN_REQUESTS_MS);
+    }
+
+    return { rides, requestCount, followUpCount, failedWindows };
+  }
+
+  // ── Step 2: turn raw rides into flat rows ───────────────────────────────────────
+
+  function toRow(ride) {
+    const cents = parseCents(ride.price?.formatted);
+    return {
+      rideId: ride.rideId,
+      start: formatDateTime(ride.startTimeMs),
+      end: formatDateTime(ride.endTimeMs),
+      minutes: Math.round(Number(ride.duration) / MS_PER_MINUTE),
+      bike: ride.rideableName,
+      price: ride.price?.formatted ?? '',
+      cents,
+      cappedCents: Math.min(cents ?? 0, PRICE_CAP_CENTS),
+      amountRaw: ride.price?.amount ?? '',
+      currency: ride.price?.currency ?? '',
+    };
+  }
+
+  /** Rows sorted newest first. */
   function toRows(rides) {
     return [...rides.values()]
       .sort((a, b) => Number(b.startTimeMs) - Number(a.startTimeMs))
-      .map((r) => {
-        const cents = toCents(r.price?.formatted);
-        return {
-          rideId: r.rideId,
-          start: localTime(r.startTimeMs),
-          end: localTime(r.endTimeMs),
-          minutes: Math.round(Number(r.duration) / MS_PER_MIN),
-          bike: r.rideableName,
-          price: r.price?.formatted ?? '',
-          cents,
-          cappedCents: Math.min(cents ?? 0, PRICE_CAP_CENTS),
-          amountRaw: r.price?.amount ?? '',
-          currency: r.price?.currency ?? '',
-        };
-      });
+      .map(toRow);
   }
 
-  // ── step 3: per-month and whole-period totals, actual vs capped ─────────────────
+  // ── Step 3: totals per month and for the whole period ───────────────────────────
+
+  function emptyTotals() {
+    return { rides: 0, freeRides: 0, ridesOverCap: 0, minutes: 0, cents: 0, cappedCents: 0 };
+  }
+
+  function addToTotals(totals, row) {
+    totals.rides += 1;
+    totals.minutes += row.minutes;
+    totals.cents += row.cents ?? 0;
+    totals.cappedCents += row.cappedCents;
+    if (row.cents === 0) totals.freeRides += 1;
+    if (row.cents > PRICE_CAP_CENTS) totals.ridesOverCap += 1;
+  }
+
   function summarize(rows) {
-    const bucket = () => ({ rides: 0, minutes: 0, cents: 0, capped: 0, over: 0, free: 0 });
-    const months = {};
-    const period = bucket();
-    for (const r of rows) {
-      for (const m of [(months[r.start.slice(0, 7)] ??= bucket()), period]) {
-        m.rides++; m.minutes += r.minutes; m.cents += r.cents ?? 0; m.capped += r.cappedCents;
-        if (r.cents > PRICE_CAP_CENTS) m.over++;
-        if (r.cents === 0) m.free++;
-      }
+    const byMonth = {}; // "2026-11" → totals
+    const wholePeriod = emptyTotals();
+    for (const row of rows) {
+      const month = row.start.slice(0, 7);
+      byMonth[month] ??= emptyTotals();
+      addToTotals(byMonth[month], row);
+      addToTotals(wholePeriod, row);
     }
-    return { months, period, unparsed: rows.filter((r) => r.cents === null) };
+    const unparsedRows = rows.filter((row) => row.cents === null);
+    return { byMonth, wholePeriod, unparsedRows };
   }
 
-  function monthTable({ months, period }) {
-    const capLabel = dollars(PRICE_CAP_CENTS);
-    const tableRow = (m) => ({
-      rides: m.rides, free: m.free, minutes: m.minutes, total: dollars(m.cents),
-      [`rides > ${capLabel}`]: m.over, 'capped total': dollars(m.capped), saved: dollars(m.cents - m.capped),
-    });
-    const table = Object.fromEntries(Object.entries(months).sort().map(([k, m]) => [k, tableRow(m)]));
-    table[`${PERIOD_LABEL} total`] = tableRow(period); // non-numeric key, so console.table lists it last
-    return table;
+  // ── Step 4: print the report ────────────────────────────────────────────────────
+
+  function toTableRow(totals) {
+    return {
+      rides: totals.rides,
+      free: totals.freeRides,
+      minutes: totals.minutes,
+      total: formatDollars(totals.cents),
+      [`rides > ${formatDollars(PRICE_CAP_CENTS)}`]: totals.ridesOverCap,
+      'capped total': formatDollars(totals.cappedCents),
+      saved: formatDollars(totals.cents - totals.cappedCents),
+    };
   }
 
-  // ── step 4: console report ──────────────────────────────────────────────────────
-  function report({ rows, summary, crawl }) {
-    const { period, unparsed } = summary;
-    const { requests, followUps, failed } = crawl;
-    log.table(monthTable(summary));
-    log.log([
-      `${PERIOD_LABEL} (${day(periodStart)}..${day(periodEnd)}): ${rows.length} rides, total ${dollars(period.cents)}`,
-      `with a ${dollars(PRICE_CAP_CENTS)}/ride cap: ${dollars(period.capped)}, saving ${dollars(period.cents - period.capped)}`
-        + ` across ${period.over} rides over the cap`,
-      `requests: ${requests} (${followUps} window follow-ups)`,
-      failed.length
-        ? `✗ INCOMPLETE: ${failed.length} windows failed: ${failed.map((w) => `${span([w])} (${w.why})`).join('; ')}`
-        : '',
-      unparsed.length ? `✗ ${unparsed.length} prices could not be parsed: ${unparsed.map((r) => r.price).join(', ')}` : '',
-    ].filter(Boolean).join('\n'));
+  function printReport({ rows, summary, fetchResult, periodStart, periodEnd }) {
+    const { byMonth, wholePeriod, unparsedRows } = summary;
+    const { requestCount, followUpCount, failedWindows } = fetchResult;
+
+    const table = {};
+    for (const month of Object.keys(byMonth).sort()) table[month] = toTableRow(byMonth[month]);
+    table[`${PERIOD_LABEL} total`] = toTableRow(wholePeriod); // not a number, so console.table lists it last
+    log.table(table);
+
+    const saved = wholePeriod.cents - wholePeriod.cappedCents;
+    const lines = [
+      `${PERIOD_LABEL} (${formatDate(periodStart)}..${formatDate(periodEnd)}): `
+        + `${rows.length} rides, total ${formatDollars(wholePeriod.cents)}`,
+      `with a ${formatDollars(PRICE_CAP_CENTS)}/ride cap: ${formatDollars(wholePeriod.cappedCents)}, `
+        + `saving ${formatDollars(saved)} across ${wholePeriod.ridesOverCap} rides over the cap`,
+      `requests: ${requestCount} (${followUpCount} window follow-ups)`,
+    ];
+    if (failedWindows.length > 0) {
+      const details = failedWindows.map((w) => `${describeWindows([w])} (${w.reason})`).join('; ');
+      lines.push(`✗ INCOMPLETE: ${failedWindows.length} windows failed: ${details}`);
+    }
+    if (unparsedRows.length > 0) {
+      lines.push(`✗ ${unparsedRows.length} prices could not be parsed: ${unparsedRows.map((r) => r.price).join(', ')}`);
+    }
+    log.log(lines.join('\n'));
   }
 
-  // ── step 5: CSV download ────────────────────────────────────────────────────────
+  // ── Step 5: CSV download ────────────────────────────────────────────────────────
+
+  /** Quote a CSV cell only if it contains a quote, comma or newline. */
+  function csvCell(value) {
+    const text = String(value ?? '');
+    return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+  }
+
   function toCsv(rows) {
-    const esc = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v ?? ''));
-    return [CSV_COLUMNS.join(','), ...rows.map((r) => CSV_COLUMNS.map((c) => esc(r[c])).join(','))].join('\n');
+    const header = CSV_COLUMNS.join(',');
+    const lines = rows.map((row) => CSV_COLUMNS.map((column) => csvCell(row[column])).join(','));
+    return [header, ...lines].join('\n');
   }
 
-  function download(csv) {
-    const today = new Date().toLocaleDateString(CSV_LOCALE, { timeZone: TIME_ZONE });
-    const filename = `${today}-citibike-rides-last-${LOOKBACK_DAYS}-days.csv`;
-    if (env.download) return env.download(filename, csv);
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(a.href);
+  function downloadCsv(csv) {
+    const filename = `${formatDate(Date.now())}-citibike-rides-last-${LOOKBACK_DAYS}-days.csv`;
+    if (testHooks.download) {
+      testHooks.download(filename, csv);
+      return;
+    }
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(link.href);
   }
 
-  // ── main ────────────────────────────────────────────────────────────────────────
-  const periodEnd = now();
+  // ── Run ─────────────────────────────────────────────────────────────────────────
+
+  const periodEnd = getNow();
   const periodStart = periodEnd - LOOKBACK_DAYS * MS_PER_DAY;
 
-  const crawl = await crawlPeriod(periodStart, periodEnd);
-  const rows = toRows(crawl.rides);
+  const fetchResult = await fetchAllRides(periodStart, periodEnd);
+  const rows = toRows(fetchResult.rides);
   const summary = summarize(rows);
-  report({ rows, summary, crawl });
+  printReport({ rows, summary, fetchResult, periodStart, periodEnd });
   const csv = toCsv(rows);
-  download(csv);
+  downloadCsv(csv);
 
-  const { cents: totalCents, capped: cappedCents, over: overCap } = summary.period;
+  const { cents, cappedCents, ridesOverCap } = summary.wholePeriod;
   const result = {
-    periodStart, periodEnd, days: LOOKBACK_DAYS, rows, totalCents, cappedCents, savedCents: totalCents - cappedCents, overCap,
-    requests: crawl.requests, followUps: crawl.followUps, failed: crawl.failed, csv,
+    periodStart,
+    periodEnd,
+    days: LOOKBACK_DAYS,
+    rows,
+    totalCents: cents,
+    cappedCents,
+    savedCents: cents - cappedCents,
+    ridesOverCap,
+    requestCount: fetchResult.requestCount,
+    followUpCount: fetchResult.followUpCount,
+    failedWindows: fetchResult.failedWindows,
+    csv,
   };
   globalThis.citibikeRides = result;
   return result;
-})(typeof __CITIBIKE_ENV__ !== 'undefined' ? __CITIBIKE_ENV__ : {})
-  .catch((e) => { console.error('✗ citibike snippet stopped:', e); throw e; });
+})(globalThis.__CITIBIKE_TEST_HOOKS__).catch((error) => {
+  console.error('✗ citibike export stopped:', error);
+  throw error;
+});

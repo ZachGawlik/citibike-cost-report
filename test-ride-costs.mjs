@@ -112,7 +112,7 @@ function mockFetch({ cursorMode, fault, stats }) {
     const member = { __typename: 'User', id: 'u1' };
     const errors = [];
     for (const [k, v] of Object.entries(variables)) {
-      const alias = `r${k.slice(1)}`;
+      const alias = `r${k.match(/\d+$/)[0]}`; // variable "cursor7" answers alias "r7"
       const cursor = v === null ? Infinity : Number(v);
       if (ALIAS_FAULTS[fault]?.(cursor, seen)) {
         member[alias] = null;
@@ -148,24 +148,24 @@ for (const { cursorMode, fault } of CASES) {
     console: argv.v ? console : quiet,
     download: (name, csv) => { downloaded = { name, csv }; },
   };
-  const res = await vm.runInNewContext(code, { ...sandbox, __CITIBIKE_ENV__: env });
+  const res = await vm.runInNewContext(code, { ...sandbox, __CITIBIKE_TEST_HOOKS__: env });
   const got = new Set(res.rows.map((r) => r.rideId));
   const missingRides = truth.filter((r) => !got.has(r.rideId));
   const extra = res.rows.filter((r) => !truth.some((t) => t.rideId === r.rideId)).length;
   let ok;
   if (fault === 'deadWindow') {
     // Expected: those windows are reported failed, and every missing ride falls inside one.
-    const inFailed = (t) => res.failed.some((w) => t >= w.floor && t < w.cursor);
-    ok = res.failed.length > 0 && extra === 0 && missingRides.every((r) => inFailed(Number(r.startTimeMs)));
+    const inFailed = (t) => res.failedWindows.some((w) => t >= w.startMs && t < w.cursorMs);
+    ok = res.failedWindows.length > 0 && res.rows.length > truth.length / 2 && extra === 0 && missingRides.every((r) => inFailed(Number(r.startTimeMs)));
   } else {
-    ok = missingRides.length === 0 && extra === 0 && res.totalCents === truthCents && res.failed.length === 0
+    ok = missingRides.length === 0 && extra === 0 && res.totalCents === truthCents && res.failedWindows.length === 0
       && res.cappedCents === truthCapped && res.savedCents === truthCents - truthCapped
       && downloaded?.csv.split('\n').length === truth.length + 1;
   }
   if (!ok) failures++;
   echo(`${ok ? '✓ PASS' : '✗ FAIL'}  cursor ${cursorMode.padEnd(9)}  fault ${fault.padEnd(10)}`
     + `  rides ${String(res.rows.length).padStart(3)}/${truth.length}  missing ${String(missingRides.length).padStart(2)}`
-    + `  extra ${extra}  failed windows ${String(res.failed.length).padStart(2)}  requests ${stats.requests}`);
+    + `  extra ${extra}  failed windows ${String(res.failedWindows.length).padStart(2)}  requests ${stats.requests}`);
 }
 const seq = Math.ceil(truth.length / SERVER_DEFAULT_LIMIT);
 echo(failures
