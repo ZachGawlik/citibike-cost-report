@@ -1,12 +1,11 @@
 // Citi Bike: export one year of ride costs to CSV. Paste into the DevTools console on
 // https://account.citibikenyc.com/ride-history while logged in. Edit YEAR below first.
 //
-// Fetching: plain sequential paging, the same way the page's "Show more" button
-// works. One GraphQL request = one page of rides (the server fixes the page size at
-// 10; `limit` is rejected). Each request's cursor is the oldest ride of the previous
-// page, starting from Jan 1 of the following year, and the crawl stops once a page
-// reaches back past Jan 1 of YEAR. Cost: about one request per 10 rides in the year,
-// plus one.
+// Fetching: the server pages by time ("rides before startTimeMs", 10 at a time, no
+// page-size arg). To cut round trips, the year is split into WINDOW_DAYS windows and
+// one cursor per window goes into a single GraphQL request as field aliases
+// (r0..rN); a window only gets a follow-up lookup if its page filled before
+// reaching the window's start.
 //
 // Monthly/yearly totals and the price-cap math are computed afterwards from the
 // fetched rides. The result lands in `citibikeRides` (window global), and a CSV is
@@ -16,15 +15,18 @@
   const YEAR = env.year ?? new Date().getFullYear(); // calendar year to export
   const TIME_ZONE = 'America/New_York';               // timestamps in the CSV / month buckets
   const ENDPOINT = '/bikesharefe-gql';                // same-origin GraphQL endpoint the page uses
-  const CURSOR_BACKOFF_MS = 30_000;                   // the page's own step, used only if a page makes no progress
+  const WINDOW_DAYS = 4;                              // span per cursor; aim for <10 rides/window
+  const ALIASES_PER_REQUEST = 30;                     // cursors batched into one request
+  const CURSOR_BACKOFF_MS = 30_000;                   // the page's own step, used if no progress
   const REQUEST_GAP_MS = env.gapMs ?? 300;            // pause between requests (be polite)
   const REQUEST_TIMEOUT_MS = env.timeoutMs ?? 45_000; // abort a request that hangs this long
   const RETRY_BACKOFF_MS = env.gapMs ?? 3_000;        // pause after a failed request
-  const MAX_TRIES = 3;                                // attempts per page before stopping
-  const MAX_REQUESTS = 1_000;                         // runaway guard (~10,000 rides)
+  const MAX_TRIES = 3;                                // attempts per single window before skipping it
+  const MAX_REQUESTS = 600;                           // runaway guard
   const PRICE_CAP_CENTS = env.capCents ?? 365;        // hypothetical per-ride price ceiling ($3.65)
   const CSV_LOCALE = 'sv-SE';                         // locale whose format is "YYYY-MM-DD HH:MM:SS"
   const CSV_COLUMNS = ['rideId', 'start', 'end', 'minutes', 'bike', 'price', 'cents', 'cappedCents', 'amountRaw', 'currency'];
+  const MS_PER_DAY = 86_400_000;
   const MS_PER_MIN = 60_000;
 
   const doFetch = env.fetch ?? globalThis.fetch.bind(globalThis);
@@ -32,12 +34,13 @@
   const log = env.console ?? console;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  const QUERY = `query CitibikeRidePage($startTimeMs: String) {
-    member { id rideHistory(startTimeMs: $startTimeMs) { limit hasMore rideHistoryList {
-      rideId startTimeMs endTimeMs duration rideableName price { amount currency formatted } } } } }`;
+  const RIDE_FIELDS = `limit hasMore rideHistoryList {
+    rideId startTimeMs endTimeMs duration rideableName price { amount currency formatted } }`;
 
   // ── small helpers ───────────────────────────────────────────────────────────────
   const localTime = (ms) => new Date(Number(ms)).toLocaleString(CSV_LOCALE, { timeZone: TIME_ZONE });
+  const day = (ms) => new Date(ms).toLocaleDateString(CSV_LOCALE, { timeZone: TIME_ZONE });
+  const span = (ws) => `${day(Math.min(...ws.map((w) => w.floor)))}..${day(Math.max(...ws.map((w) => w.cursor)))}`;
   const dollars = (c) => `$${(c / 100).toFixed(2)}`;
   const toCents = (formatted) => {
     const m = /(-)?\$?\s*([\d,]+)\.(\d{2})/.exec(formatted ?? '');
@@ -46,9 +49,16 @@
   };
 
   // ── network ─────────────────────────────────────────────────────────────────────
+  function buildQuery(n) {
+    const vars = Array.from({ length: n }, (_, i) => `$c${i}: String`).join(', ');
+    const fields = Array.from({ length: n }, (_, i) =>
+      `r${i}: rideHistory(startTimeMs: $c${i}) { ${RIDE_FIELDS} }`).join('\n');
+    return `query CitibikeYearRides(${vars}) { member { id\n${fields} } }`;
+  }
+
   // Returns the parsed body ({data, errors}); throws on timeout, HTTP error without
   // a JSON body, or network failure.
-  async function gql(variables) {
+  async function gql(query, variables) {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS);
     try {
@@ -57,7 +67,7 @@
         credentials: 'include',
         signal: ctl.signal,
         headers: { 'content-type': 'application/json', 'Apollo-Require-Preflight': 'true' },
-        body: JSON.stringify({ operationName: 'CitibikeRidePage', query: QUERY, variables }),
+        body: JSON.stringify({ operationName: 'CitibikeYearRides', query, variables }),
       });
       let body;
       try { body = await res.json(); } catch { body = null; }
@@ -71,52 +81,87 @@
     }
   }
 
-  // One page, retried up to MAX_TRIES. Each cursor depends on the previous page, so
-  // a page that keeps failing stops the run (rides so far stay in
-  // citibikeRidesPartial).
-  async function fetchPage(cursor) {
-    for (let attempt = 1; ; attempt++) {
-      let why;
-      try {
-        const res = await gql({ startTimeMs: String(cursor) });
-        const page = res.data?.member?.rideHistory;
-        if (page) return page;
-        why = `GraphQL error: ${res.errors?.map((e) => e.message).join('; ') ?? 'no data'}`;
-      } catch (e) {
-        why = e.message;
-      }
-      if (attempt >= MAX_TRIES) throw new Error(`page before ${localTime(cursor)} failed ${MAX_TRIES}×: ${why}`);
-      log.warn(`  ↻ ${why} — try ${attempt + 1}/${MAX_TRIES}`);
-      await sleep(RETRY_BACKOFF_MS);
-    }
-  }
-
-  // ── step 1: fetch every ride in [yearStart, yearEnd), newest first ──────────────
+  // ── step 1: fetch every ride in [yearStart, yearEnd) via batched windows ────────
+  // A failed request (error, timeout, HTTP 4xx/5xx) is split in half and retried,
+  // so one bad window or a server-side size limit can't stall the whole run. A
+  // single window that keeps failing is recorded in `failed` and skipped.
   async function crawlYear(yearStart, yearEnd) {
-    const rides = new Map(); // rideId → raw ride; dedupes any page overlap
-    globalThis.citibikeRidesPartial = rides;
-    let requests = 0;
-    let cursor = yearEnd;
-    for (;;) {
-      if (requests >= MAX_REQUESTS) throw new Error(`gave up after ${MAX_REQUESTS} requests`);
-      requests++;
-      const page = await fetchPage(cursor);
-      const list = page.rideHistoryList ?? [];
-      let oldest = Infinity;
-      for (const r of list) {
-        const t = Number(r.startTimeMs);
-        oldest = Math.min(oldest, t);
-        if (t >= yearStart && t < yearEnd) rides.set(r.rideId, r);
-      }
-      log.log(`request ${requests}: ${list.length} rides back to ${list.length ? localTime(oldest) : '—'}`
-        + ` → ${rides.size} in ${YEAR} so far`);
-      if (!list.length || !page.hasMore || oldest < yearStart) break;
-      // Next page starts at this page's oldest ride; dedupe by rideId absorbs any
-      // overlap if the server treats the cursor inclusively.
-      cursor = oldest < cursor ? oldest : cursor - CURSOR_BACKOFF_MS;
-      await sleep(REQUEST_GAP_MS);
+    const windowMs = WINDOW_DAYS * MS_PER_DAY;
+    const pending = [];
+    for (let hi = yearEnd; hi > yearStart; hi -= windowMs) {
+      pending.push({ cursor: hi, floor: Math.max(yearStart, hi - windowMs), tries: 0 });
     }
-    return { rides, requests };
+
+    const rides = new Map(); // rideId → raw ride; dedupes any page overlap
+    const failed = [];
+    let requests = 0;
+    let followUps = 0;
+    let batchSize = ALIASES_PER_REQUEST;
+    globalThis.citibikeRidesPartial = { rides, pending, failed };
+
+    const retry = (ws, why) => {
+      if (ws.length > 1) {
+        batchSize = Math.max(1, Math.floor(ws.length / 2));
+        log.warn(`  ↻ ${why} — retrying these ${ws.length} windows in batches of ${batchSize}`);
+        pending.unshift(...ws);
+        return;
+      }
+      const w = ws[0];
+      if (++w.tries < MAX_TRIES) {
+        log.warn(`  ↻ ${why} — window ${span(ws)}, try ${w.tries + 1}/${MAX_TRIES}`);
+        pending.unshift(w);
+      } else {
+        log.warn(`  ✗ ${why} — giving up on window ${span(ws)}`);
+        failed.push({ ...w, why });
+      }
+    };
+
+    while (pending.length) {
+      if (requests >= MAX_REQUESTS) throw new Error(`gave up after ${MAX_REQUESTS} requests`);
+      const batch = pending.splice(0, batchSize);
+      const vars = Object.fromEntries(batch.map((w, i) => [`c${i}`, String(w.cursor)]));
+      requests++;
+      log.log(`request ${requests}: ${batch.length} windows ${span(batch)} …`);
+      let res;
+      try {
+        res = await gql(buildQuery(batch.length), vars);
+      } catch (e) {
+        retry(batch, e.message);
+        await sleep(RETRY_BACKOFF_MS);
+        continue;
+      }
+      if (!res.data?.member) {
+        retry(batch, `GraphQL error: ${res.errors?.map((e) => e.message).join('; ') ?? 'no data'}`);
+        await sleep(RETRY_BACKOFF_MS);
+        continue;
+      }
+      // Partial errors: aliases that errored come back null; requeue just those.
+      const bad = [];
+      batch.forEach((w, i) => {
+        const page = res.data.member[`r${i}`];
+        if (!page) { bad.push(w); return; }
+        const list = page.rideHistoryList ?? [];
+        let oldest = Infinity;
+        for (const r of list) {
+          const t = Number(r.startTimeMs);
+          oldest = Math.min(oldest, t);
+          if (t >= yearStart && t < yearEnd) rides.set(r.rideId, r);
+        }
+        // Window not exhausted: page was full and still hasn't reached the window floor.
+        if (page.hasMore && list.length >= page.limit && oldest > w.floor) {
+          const cursor = oldest < w.cursor ? oldest : w.cursor - CURSOR_BACKOFF_MS;
+          pending.push({ cursor, floor: w.floor, tries: 0 });
+          followUps++;
+        }
+      });
+      if (bad.length) {
+        const why = `GraphQL error: ${res.errors?.[0]?.message ?? 'null result'}`;
+        for (const w of bad) retry([w], why);
+      }
+      log.log(`  → ${rides.size} rides so far, ${pending.length} windows pending`);
+      if (pending.length) await sleep(REQUEST_GAP_MS);
+    }
+    return { rides, requests, followUps, failed };
   }
 
   // ── step 2: raw rides → flat rows (newest first), with capped price ─────────────
@@ -167,14 +212,18 @@
   }
 
   // ── step 4: console report ──────────────────────────────────────────────────────
-  function report({ rows, summary, requests }) {
+  function report({ rows, summary, crawl }) {
     const { year, unparsed } = summary;
+    const { requests, followUps, failed } = crawl;
     log.table(monthTable(summary));
     log.log([
       `${YEAR}: ${rows.length} rides, total ${dollars(year.cents)}`,
       `with a ${dollars(PRICE_CAP_CENTS)}/ride cap: ${dollars(year.capped)}, saving ${dollars(year.cents - year.capped)}`
         + ` across ${year.over} rides over the cap`,
-      `requests: ${requests} for ${rows.length} rides`,
+      `requests: ${requests} (${followUps} window follow-ups)`,
+      failed.length
+        ? `✗ INCOMPLETE: ${failed.length} windows failed: ${failed.map((w) => `${span([w])} (${w.why})`).join('; ')}`
+        : '',
       unparsed.length ? `✗ ${unparsed.length} prices could not be parsed: ${unparsed.map((r) => r.price).join(', ')}` : '',
     ].filter(Boolean).join('\n'));
   }
@@ -200,17 +249,17 @@
   const yearStart = new Date(YEAR, 0, 1).getTime();
   const yearEnd = Math.min(new Date(YEAR + 1, 0, 1).getTime(), now());
 
-  const { rides, requests } = await crawlYear(yearStart, yearEnd);
-  const rows = toRows(rides);
+  const crawl = await crawlYear(yearStart, yearEnd);
+  const rows = toRows(crawl.rides);
   const summary = summarize(rows);
-  report({ rows, summary, requests });
+  report({ rows, summary, crawl });
   const csv = toCsv(rows);
   download(csv);
 
   const { cents: totalCents, capped: cappedCents, over: overCap } = summary.year;
   const result = {
     year: YEAR, rows, totalCents, cappedCents, savedCents: totalCents - cappedCents, overCap,
-    requests, csv,
+    requests: crawl.requests, followUps: crawl.followUps, failed: crawl.failed, csv,
   };
   globalThis.citibikeRides = result;
   return result;
