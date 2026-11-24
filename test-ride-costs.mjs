@@ -4,9 +4,9 @@ import vm from 'node:vm';
 
 // ── tunables ──────────────────────────────────────────────────────────────────────
 const SNIPPET = path.join(__dirname, 'citibike-ride-costs.js');
-const YEAR = 2026;                                  // year the snippet exports
+const LOOKBACK_DAYS = 365;                          // must match the snippet's LOOKBACK_DAYS default
 const NOW = new Date(2026, 10, 23, 16, 0).getTime(); // frozen "now" (2026-11-23 16:00)
-const DATA_START = new Date(2025, 11, 1).getTime(); // synthetic rides begin (before YEAR, to test the floor)
+const DATA_START = new Date(2025, 9, 1).getTime();  // synthetic rides begin (before the lookback, to test the floor)
 const RIDES_PER_DAY_MAX = 4;                        // random 0..max rides per normal day
 const BURST_DAY = new Date(2026, 5, 14).getTime();  // one day with far more rides than a page holds
 const BURST_RIDES = 37;
@@ -20,6 +20,7 @@ const HTTP502_EVERY = 3;                            // http502 fault: every Nth 
 const TEST_TIMEOUT_MS = 50;                         // snippet request timeout during tests (hang fault)
 const MS_PER_DAY = 86_400_000;
 const MS_PER_MIN = 60_000;
+const PERIOD_START = NOW - LOOKBACK_DAYS * MS_PER_DAY; // earliest ride the snippet should include
 
 const HELP = `usage: test-ride-costs.mjs [-v]
        test-ride-costs.mjs --help | -h | help
@@ -62,12 +63,12 @@ for (let d = DATA_START; d < NOW; d += MS_PER_DAY) {
   for (let i = 0; i < n; i++) addRide(d + Math.floor(rand() * MS_PER_DAY));
 }
 for (let i = 0; i < BURST_RIDES; i++) addRide(BURST_DAY + i * 7 * MS_PER_MIN);
-addRide(new Date(YEAR, 0, 1).getTime());         // exactly at the year start
-addRide(new Date(YEAR, 0, 1).getTime() - 1);     // 1ms before: must be excluded
+addRide(PERIOD_START);                           // exactly at the lookback start
+addRide(PERIOD_START - 1);                       // 1ms before: must be excluded
 rides.sort((a, b) => b.startTimeMs - a.startTimeMs);
 
-const yearStart = new Date(YEAR, 0, 1).getTime();
-const truth = rides.filter((r) => r.startTimeMs >= yearStart && r.startTimeMs < NOW);
+
+const truth = rides.filter((r) => r.startTimeMs >= PERIOD_START && r.startTimeMs < NOW);
 const truthCents = truth.reduce((s, r) => s + r.price.amount, 0);
 const CAP_CENTS = 365;                           // must match the snippet's PRICE_CAP_CENTS default
 const truthCapped = truth.reduce((s, r) => s + Math.min(r.price.amount, CAP_CENTS), 0);
@@ -142,7 +143,7 @@ for (const { cursorMode, fault } of CASES) {
   const stats = { requests: 0 };
   let downloaded;
   const env = {
-    year: YEAR, now: () => NOW, gapMs: 0, timeoutMs: TEST_TIMEOUT_MS,
+    now: () => NOW, gapMs: 0, timeoutMs: TEST_TIMEOUT_MS,
     fetch: mockFetch({ cursorMode, fault, stats }),
     console: argv.v ? console : quiet,
     download: (name, csv) => { downloaded = { name, csv }; },
