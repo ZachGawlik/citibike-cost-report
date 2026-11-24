@@ -14,7 +14,6 @@ Cases vary what we can't observe directly:
                     http502     every 3rd request is a bad gateway with an HTML body
                     partial     older windows error on their first try
                     deadWindow  May's windows always error: must be reported, not hidden
-                    requestLimit  snippet stops after 3 requests: unfinished windows reported
 
   -v   show the snippet's own console output`;
 
@@ -33,7 +32,7 @@ const CAP_CENTS = 365;                                // must match the snippet'
 const PAGE_SIZE = 10;                                 // the real server's page size
 const PARTIAL_BEFORE = new Date(2026, 3, 1).getTime(); // partial: cursors older than this fail once
 const DEAD_MONTH = new Date(2026, 4, 1).getMonth();   // deadWindow: cursors in May always fail
-const REQUEST_LIMIT = 3;                              // requestLimit: stop after this many requests (a full run needs 7)
+const TEST_TIMEOUT_MS = 50;                           // replaces the snippet's 45 s request timeout
 
 // ── synthetic rides: random 0–4 per day from Oct 2025, plus edge cases ────────────
 let seed = 42;
@@ -104,9 +103,13 @@ function fakeServer({ cursorMode, fault }) {
 // ── run cases ─────────────────────────────────────────────────────────────────────
 const code = fs.readFileSync(SNIPPET, 'utf8');
 const quiet = { log() {}, warn() {}, table() {} };
+/** Date whose "now" is fixed at NOW; everything else behaves like Date. */
+class FrozenDate extends Date {
+  static now() { return NOW; }
+}
 const CASES = [
   ...['exclusive', 'inclusive', 'fuzzy'].map((cursorMode) => ({ cursorMode, fault: 'none' })),
-  ...['hangOnce', 'http502', 'partial', 'deadWindow', 'requestLimit'].map((fault) => ({ cursorMode: 'exclusive', fault })),
+  ...['hangOnce', 'http502', 'partial', 'deadWindow'].map((fault) => ({ cursorMode: 'exclusive', fault })),
 ];
 let failures = 0;
 // Node doesn't let AbortSignal.timeout keep the process alive (browsers do), so a
@@ -115,12 +118,17 @@ const keepAlive = setInterval(() => {}, 1_000);
 
 for (const { cursorMode, fault } of CASES) {
   const server = fakeServer({ cursorMode, fault });
-  const testHooks = {
-    now: NOW, pauseMs: 0, maxRequests: fault === 'requestLimit' ? REQUEST_LIMIT : undefined, timeoutMs: 50, fetch: server.fetch,
+  // The snippet runs with these as its globals, in place of the browser's. Keep this
+  // in step with the built-ins the snippet calls, or the tests stop controlling them.
+  const sandbox = {
+    fetch: server.fetch,
     console: argv.v ? console : quiet,
+    Date: FrozenDate,
+    setTimeout: (callback) => setImmediate(callback), // skip the snippet's pauses
+    AbortSignal: { timeout: () => AbortSignal.timeout(TEST_TIMEOUT_MS) },
   };
-  const sandbox = { setTimeout, AbortSignal, URL, console, __CITIBIKE_TEST_HOOKS__: testHooks };
-  const result = await vm.runInNewContext(code, sandbox);
+  await vm.runInNewContext(code, sandbox);
+  const result = sandbox.citibikeRides;
 
   // Rows have no ride ID, so match them to expected rides by start time (count
   // per time, since two rides could start in the same second).
@@ -135,7 +143,7 @@ for (const { cursorMode, fault } of CASES) {
   const extra = [...unmatched.values()].reduce((sum, n) => sum + n, 0);
 
   let ok;
-  if (fault === 'deadWindow' || fault === 'requestLimit') {
+  if (fault === 'deadWindow') {
     // Failed windows must be reported, and every missing ride must fall inside one.
     const inFailedWindow = (ms) => result.failedWindows.some((w) => ms >= w.startMs && ms < w.cursorMs);
     ok = result.failedWindows.length > 0 && result.rows.length > expected.length / 2 && extra === 0

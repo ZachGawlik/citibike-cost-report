@@ -25,7 +25,7 @@
 //   - Console: progress lines, the totals table, and the `citibikeRides` variable
 //     (which holds the CSV text).
 
-(async (testHooks = {}) => {
+(async () => {
   // ── Settings ────────────────────────────────────────────────────────────────────
   const LOOKBACK_DAYS = 365;                    // rides that started within this many days
   const PRICE_CAP_CENTS = 365;                  // hypothetical per-ride ceiling: $3.65
@@ -34,14 +34,10 @@
   const WINDOW_DAYS = 4;                        // time span per window (aim: < 10 rides each)
   const WINDOWS_PER_REQUEST = 30;               // windows asked for in one request
   const MAX_ATTEMPTS_PER_WINDOW = 3;            // then the window is reported as failed
-  const MAX_REQUESTS = testHooks.maxRequests ?? 100; // safety stop; a normal year needs ~5–10
-  const PAUSE_MS = testHooks.pauseMs ?? 300;    // between requests, to be polite
-  const TIMEOUT_MS = testHooks.timeoutMs ?? 45_000;
+  const MAX_REQUESTS = 100;                     // safety stop; a normal year needs ~5–10
+  const PAUSE_MS = 300;                         // between requests, to be polite
+  const TIMEOUT_MS = 45_000;                    // give up on a request after this long
   const MS_PER_DAY = 86_400_000;
-
-  // Test hooks let test-ride-costs.mjs run this file against a fake server.
-  const fetchFn = testHooks.fetch ?? globalThis.fetch.bind(globalThis);
-  const log = testHooks.console ?? console;
 
   // ── Helpers ─────────────────────────────────────────────────────────────────────
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -80,7 +76,7 @@
    */
   async function fetchPages(windows) {
     const variables = Object.fromEntries(windows.map((w, i) => [`cursor${i}`, String(w.cursorMs)]));
-    const response = await fetchFn(ENDPOINT, {
+    const response = await fetch(ENDPOINT, {
       method: 'POST',
       credentials: 'include', // send the logged-in session cookies
       signal: AbortSignal.timeout(TIMEOUT_MS),
@@ -116,7 +112,7 @@
       if (window.attempts < MAX_ATTEMPTS_PER_WINDOW) {
         queue.unshift(window);
       } else {
-        log.warn(`✗ giving up on window from ${formatDateTime(window.startMs)}: ${reason}`);
+        console.warn(`✗ giving up on window from ${formatDateTime(window.startMs)}: ${reason}`);
         failedWindows.push({ ...window, reason });
       }
     }
@@ -129,13 +125,13 @@
       }
       const batch = queue.splice(0, WINDOWS_PER_REQUEST);
       requestCount += 1;
-      log.log(`request ${requestCount}: ${batch.length} windows, ${rides.size} rides so far`);
+      console.log(`request ${requestCount}: ${batch.length} windows, ${rides.size} rides so far`);
 
       let pages;
       try {
         pages = await fetchPages(batch);
       } catch (error) {
-        log.warn(`↻ request failed, retrying: ${error.message}`);
+        console.warn(`↻ request failed, retrying: ${error.message}`);
         batch.forEach((window) => retryOrGiveUp(window, error.message));
         await sleep(PAUSE_MS);
         continue;
@@ -202,10 +198,10 @@
     const table = {};
     for (const [month, totals] of Object.entries(byMonth)) table[month] = tableRow(totals);
     table.total = tableRow(total);
-    log.table(table);
-    log.log(`${total.rides} rides in the last ${LOOKBACK_DAYS} days, ${requestCount} requests`);
+    console.table(table);
+    console.log(`${total.rides} rides in the last ${LOOKBACK_DAYS} days, ${requestCount} requests`);
     if (failedWindows.length > 0) {
-      log.warn(`✗ INCOMPLETE: ${failedWindows.length} windows failed; totals are missing their rides`);
+      console.warn(`✗ INCOMPLETE: ${failedWindows.length} windows failed; totals are missing their rides`);
     }
   }
 
@@ -217,7 +213,7 @@
   }
 
   // ── Run ─────────────────────────────────────────────────────────────────────────
-  const periodEnd = testHooks.now ?? Date.now();
+  const periodEnd = Date.now();
   const periodStart = periodEnd - LOOKBACK_DAYS * MS_PER_DAY;
 
   const { rides, requestCount, failedWindows } = await fetchAllRides(periodStart, periodEnd);
@@ -227,6 +223,5 @@
 
   globalThis.citibikeRides = { rows, csv: toCsv(rows), ...summary, requestCount, failedWindows };
   // copy() is a DevTools console helper: it only works when typed at the prompt.
-  log.log('To copy the rides as CSV to your clipboard, run:  copy(citibikeRides.csv)');
-  return globalThis.citibikeRides;
-})(globalThis.__CITIBIKE_TEST_HOOKS__);
+  console.log('To copy the rides as CSV to your clipboard, run:  copy(citibikeRides.csv)');
+})();
