@@ -2,6 +2,11 @@
 // Runs citibike-ride-costs.js against a fake GraphQL server; see --help.
 import vm from 'node:vm';
 
+// The snippet should format times in New York time whatever the computer's zone.
+// Run under a different zone so a slip back to local time fails the test; Node
+// applies this to Dates created after.
+process.env.TZ = 'Asia/Tokyo';
+
 const HELP = `usage: citibike-ride-costs.test.mjs [-v]
        citibike-ride-costs.test.mjs --help | -h | help
 
@@ -56,7 +61,8 @@ addRide(PERIOD_START);     // exactly at the period start: included
 addRide(PERIOD_START - 1); // 1 ms before: excluded
 rides.sort((a, b) => b.startTimeMs - a.startTimeMs);
 
-// Same format as the snippet's `start` column.
+// Same format as the snippet's `start` column, built a different way (the sv-SE
+// locale's ISO-like output instead of formatToParts) so it checks the snippet's code.
 const formatStart = (ms) => new Date(Number(ms)).toLocaleString('sv-SE', { timeZone: 'America/New_York' });
 const expected = rides.filter((r) => r.startTimeMs >= PERIOD_START && r.startTimeMs < NOW);
 const expectedCents = expected.reduce((sum, r) => sum + r.cents, 0);

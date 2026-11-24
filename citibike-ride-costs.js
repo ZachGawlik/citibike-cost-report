@@ -27,13 +27,23 @@
   // ── Settings ────────────────────────────────────────────────────────────────────
   const LOOKBACK_DAYS = 365;                    // rides that started within this many days
   const PRICE_CAP_CENTS = 365;                  // hypothetical per-ride ceiling: $3.65
-  const TIME_ZONE = 'America/New_York';         // for printed times and month grouping
+  const TIME_ZONE = 'America/New_York';         // for ride times and month grouping
   const MS_PER_DAY = 86_400_000;
 
   // ── Helpers ─────────────────────────────────────────────────────────────────────
 
-  /** "2026-11-20 16:27:14" in New York time (the sv-SE locale gives ISO-like dates). */
-  const formatDateTime = (ms) => new Date(Number(ms)).toLocaleString('sv-SE', { timeZone: TIME_ZONE });
+  /**
+   * "2026-11-20 16:27:14" in New York time, whatever this computer's time zone.
+   * Ride times and the month each ride is counted in both come from this.
+   */
+  const dateTimeFormat = new Intl.DateTimeFormat('en-US', {
+    timeZone: TIME_ZONE, hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  function formatDateTime(ms) {
+    const p = Object.fromEntries(dateTimeFormat.formatToParts(Number(ms)).map(({ type, value }) => [type, value]));
+    return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`;
+  }
 
   /** 353 → "$3.53" */
   const formatDollars = (cents) => `$${(cents / 100).toFixed(2)}`;
