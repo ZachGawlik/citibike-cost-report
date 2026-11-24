@@ -14,6 +14,7 @@ Cases vary what we can't observe directly:
                     http502     every 3rd request is a bad gateway with an HTML body
                     partial     older windows error on their first try
                     deadWindow  May's windows always error: must be reported, not hidden
+                    requestLimit  snippet stops after 3 requests: unfinished windows reported
 
   -v   show the snippet's own console output`;
 
@@ -32,6 +33,7 @@ const CAP_CENTS = 365;                                // must match the snippet'
 const PAGE_SIZE = 10;                                 // the real server's page size
 const PARTIAL_BEFORE = new Date(2026, 3, 1).getTime(); // partial: cursors older than this fail once
 const DEAD_MONTH = new Date(2026, 4, 1).getMonth();   // deadWindow: cursors in May always fail
+const REQUEST_LIMIT = 3;                              // requestLimit: stop after this many requests (a full run needs 7)
 
 // ── synthetic rides: random 0–4 per day from Oct 2025, plus edge cases ────────────
 let seed = 42;
@@ -104,7 +106,7 @@ const code = fs.readFileSync(SNIPPET, 'utf8');
 const quiet = { log() {}, warn() {}, table() {} };
 const CASES = [
   ...['exclusive', 'inclusive', 'fuzzy'].map((cursorMode) => ({ cursorMode, fault: 'none' })),
-  ...['hangOnce', 'http502', 'partial', 'deadWindow'].map((fault) => ({ cursorMode: 'exclusive', fault })),
+  ...['hangOnce', 'http502', 'partial', 'deadWindow', 'requestLimit'].map((fault) => ({ cursorMode: 'exclusive', fault })),
 ];
 let failures = 0;
 // Node doesn't let AbortSignal.timeout keep the process alive (browsers do), so a
@@ -115,7 +117,7 @@ for (const { cursorMode, fault } of CASES) {
   const server = fakeServer({ cursorMode, fault });
   let csv;
   const testHooks = {
-    now: NOW, pauseMs: 0, timeoutMs: 50, fetch: server.fetch,
+    now: NOW, pauseMs: 0, maxRequests: fault === 'requestLimit' ? REQUEST_LIMIT : undefined, timeoutMs: 50, fetch: server.fetch,
     console: argv.v ? console : quiet,
     download: (_filename, text) => { csv = text; },
   };
@@ -135,7 +137,7 @@ for (const { cursorMode, fault } of CASES) {
   const extra = [...unmatched.values()].reduce((sum, n) => sum + n, 0);
 
   let ok;
-  if (fault === 'deadWindow') {
+  if (fault === 'deadWindow' || fault === 'requestLimit') {
     // Failed windows must be reported, and every missing ride must fall inside one.
     const inFailedWindow = (ms) => result.failedWindows.some((w) => ms >= w.startMs && ms < w.cursorMs);
     ok = result.failedWindows.length > 0 && result.rows.length > expected.length / 2 && extra === 0

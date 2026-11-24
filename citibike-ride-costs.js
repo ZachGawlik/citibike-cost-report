@@ -32,6 +32,7 @@
   const WINDOW_DAYS = 4;                        // time span per window (aim: < 10 rides each)
   const WINDOWS_PER_REQUEST = 30;               // windows asked for in one request
   const MAX_ATTEMPTS_PER_WINDOW = 3;            // then the window is reported as failed
+  const MAX_REQUESTS = testHooks.maxRequests ?? 100; // safety stop; a normal year needs ~5–10
   const PAUSE_MS = testHooks.pauseMs ?? 300;    // between requests, to be polite
   const TIMEOUT_MS = testHooks.timeoutMs ?? 45_000;
   const MS_PER_DAY = 86_400_000;
@@ -119,6 +120,11 @@
     }
 
     while (queue.length > 0) {
+      if (requestCount >= MAX_REQUESTS) {
+        // Keep what was fetched; report the unfinished windows instead of throwing.
+        failedWindows.push(...queue.splice(0).map((w) => ({ ...w, reason: `hit ${MAX_REQUESTS}-request limit` })));
+        break;
+      }
       const batch = queue.splice(0, WINDOWS_PER_REQUEST);
       requestCount += 1;
       log.log(`request ${requestCount}: ${batch.length} windows, ${rides.size} rides so far`);
