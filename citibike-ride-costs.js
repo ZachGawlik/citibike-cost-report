@@ -3,8 +3,9 @@
 // Paste this whole file into the DevTools console on
 // https://account.citibikenyc.com/ride-history while logged in. It fetches every ride
 // from the last 365 days, prints monthly totals (actual, and what they would be with a
-// per-ride price cap), and downloads a CSV. Read-only: it only sends GraphQL queries
-// to the same endpoint the ride-history page itself uses.
+// per-ride price cap), and leaves the rides as CSV in `citibikeRides.csv`; run
+// `copy(citibikeRides.csv)` afterwards to put it on the clipboard. Read-only: it only
+// sends GraphQL queries to the same endpoint the ride-history page itself uses.
 //
 // How fetching works:
 //   - The server returns rides newest-first, 10 per page, for "rides that started
@@ -19,9 +20,10 @@
 //   - Network: fetchPages() is the only code that sends requests, all of them POSTs
 //     to /bikesharefe-gql on this same site, using your existing login. Nothing is
 //     sent anywhere else.
-//   - Page: nothing changes, apart from one temporary link used to download the CSV.
-//     It doesn't read or write cookies, localStorage or any other browser storage.
-//   - Console: progress lines, the totals table, and the `citibikeRides` variable.
+//   - Page: nothing changes. It doesn't read or write cookies, localStorage or any
+//     other browser storage.
+//   - Console: progress lines, the totals table, and the `citibikeRides` variable
+//     (which holds the CSV text).
 
 (async (testHooks = {}) => {
   // ── Settings ────────────────────────────────────────────────────────────────────
@@ -207,18 +209,11 @@
     }
   }
 
-  function downloadCsv(rows) {
+  function toCsv(rows) {
     const columns = Object.keys(rows[0] ?? {});
-    const csv = [columns, ...rows.map((row) => columns.map((c) => row[c]))]
+    return [columns, ...rows.map((row) => columns.map((c) => row[c]))]
       .map((cells) => cells.map((cell) => `"${String(cell).replaceAll('"', '""')}"`).join(','))
       .join('\n');
-    const today = formatDateTime(Date.now()).slice(0, 10);
-    const filename = `${today}-citibike-rides-last-${LOOKBACK_DAYS}-days.csv`;
-    if (testHooks.download) return testHooks.download(filename, csv);
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
-    link.download = filename;
-    link.click();
   }
 
   // ── Run ─────────────────────────────────────────────────────────────────────────
@@ -229,7 +224,9 @@
   const rows = rides.sort((a, b) => a.startTimeMs - b.startTimeMs).map(toRow); // oldest first
   const summary = summarize(rows);
   printReport(summary, requestCount, failedWindows);
-  downloadCsv(rows);
 
-  return (globalThis.citibikeRides = { rows, ...summary, requestCount, failedWindows });
+  globalThis.citibikeRides = { rows, csv: toCsv(rows), ...summary, requestCount, failedWindows };
+  // copy() is a DevTools console helper: it only works when typed at the prompt.
+  log.log('To copy the rides as CSV to your clipboard, run:  copy(citibikeRides.csv)');
+  return globalThis.citibikeRides;
 })(globalThis.__CITIBIKE_TEST_HOOKS__);

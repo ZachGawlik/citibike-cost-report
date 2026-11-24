@@ -115,11 +115,9 @@ const keepAlive = setInterval(() => {}, 1_000);
 
 for (const { cursorMode, fault } of CASES) {
   const server = fakeServer({ cursorMode, fault });
-  let csv;
   const testHooks = {
     now: NOW, pauseMs: 0, maxRequests: fault === 'requestLimit' ? REQUEST_LIMIT : undefined, timeoutMs: 50, fetch: server.fetch,
     console: argv.v ? console : quiet,
-    download: (_filename, text) => { csv = text; },
   };
   const sandbox = { setTimeout, AbortSignal, URL, console, __CITIBIKE_TEST_HOOKS__: testHooks };
   const result = await vm.runInNewContext(code, sandbox);
@@ -145,7 +143,7 @@ for (const { cursorMode, fault } of CASES) {
   } else {
     ok = missing.length === 0 && extra === 0 && result.failedWindows.length === 0
       && result.total.cents === expectedCents && result.total.cappedCents === expectedCapped
-      && csv.split('\n').length === expected.length + 1;
+      && result.csv.split('\n').length === expected.length + 1;
   }
   if (!ok) failures += 1;
   echo(`${ok ? '✓ PASS' : '✗ FAIL'}  cursor ${cursorMode.padEnd(9)}  fault ${fault.padEnd(10)}`
