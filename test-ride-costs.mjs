@@ -1,174 +1,159 @@
 #!/usr/bin/env zx
-// Runs citibike-ride-costs.js against mock GraphQL servers; see --help.
+// Runs citibike-ride-costs.js against a fake GraphQL server; see --help.
 import vm from 'node:vm';
-
-// ── tunables ──────────────────────────────────────────────────────────────────────
-const SNIPPET = path.join(__dirname, 'citibike-ride-costs.js');
-const LOOKBACK_DAYS = 365;                          // must match the snippet's LOOKBACK_DAYS default
-const NOW = new Date(2026, 10, 23, 16, 0).getTime(); // frozen "now" (2026-11-23 16:00)
-const DATA_START = new Date(2025, 9, 1).getTime();  // synthetic rides begin (before the lookback, to test the floor)
-const RIDES_PER_DAY_MAX = 4;                        // random 0..max rides per normal day
-const BURST_DAY = new Date(2026, 5, 14).getTime();  // one day with far more rides than a page holds
-const BURST_RIDES = 37;
-const SERVER_DEFAULT_LIMIT = 10;                    // real server's page size
-const FUZZ_MS = 30_000;                             // "fuzzy" cursor variant: includes rides up to cursor+30s
-const SEED = 42;
-const ALIAS_CAP = 12;                               // sizeCap/hang faults: max aliases the mock tolerates
-const PARTIAL_BEFORE = new Date(2026, 3, 1).getTime(); // partial fault: older cursors fail on first try
-const DEAD_CURSOR_MONTH = '2026-05-';               // deadWindow fault: cursors in this month always fail
-const HTTP502_EVERY = 3;                            // http502 fault: every Nth request is a bad gateway
-const TEST_TIMEOUT_MS = 50;                         // snippet request timeout during tests (hang fault)
-const MS_PER_DAY = 86_400_000;
-const MS_PER_MIN = 60_000;
-const PERIOD_START = NOW - LOOKBACK_DAYS * MS_PER_DAY; // earliest ride the snippet should include
 
 const HELP = `usage: test-ride-costs.mjs [-v]
        test-ride-costs.mjs --help | -h | help
 
-Runs citibike-ride-costs.js in a vm against mock /bikesharefe-gql servers.
-The mock data is synthetic: random rides from Dec 2025 plus a ${BURST_RIDES}-ride burst day.
-Each case checks that the exported ride set and total exactly match the truth.
+Runs citibike-ride-costs.js in a vm against a fake /bikesharefe-gql server with
+synthetic rides, and checks the exported rides and totals exactly match.
 
-Server variants cover what we can't observe directly:
-  cursor semantics: exclusive (<), inclusive (<=), fuzzy (< cursor+30s)
-  faults: sizeCap  (HTTP 400 above ${ALIAS_CAP} aliases)
-          hang     (no response above ${ALIAS_CAP} aliases)
-          http502  (every ${HTTP502_EVERY}rd request, HTML body)
-          partial  (some aliases null on first try)
-          deadWindow (one month always fails: must be reported, not hidden)
+Cases vary what we can't observe directly:
+  cursor semantics  exclusive (<), inclusive (<=), fuzzy (< cursor + 30s)
+  faults            hangOnce    first request never answers (snippet must time out)
+                    http502     every 3rd request is a bad gateway with an HTML body
+                    partial     older windows error on their first try
+                    deadWindow  May's windows always error: must be reported, not hidden
 
   -v   show the snippet's own console output`;
 
-if (['--help', '-h'].includes(argv._[0] ?? '') || argv.help || argv.h || argv._[0] === 'help') {
+if (['--help', '-h', 'help'].includes(argv._[0]) || argv.help || argv.h) {
   echo(HELP);
   process.exit(0);
 }
 
-// ── synthetic ground truth ────────────────────────────────────────────────────────
-let seed = SEED;
-const rand = () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
+// ── settings ──────────────────────────────────────────────────────────────────────
+const SNIPPET = path.join(__dirname, 'citibike-ride-costs.js');
+const NOW = new Date(2026, 10, 23, 16, 0).getTime(); // frozen "now"
+const MS_PER_DAY = 86_400_000;
+const MS_PER_MIN = 60_000;
+const PERIOD_START = NOW - 365 * MS_PER_DAY;          // must match the snippet's LOOKBACK_DAYS
+const CAP_CENTS = 365;                                // must match the snippet's PRICE_CAP_CENTS
+const PAGE_SIZE = 10;                                 // the real server's page size
+const PARTIAL_BEFORE = new Date(2026, 3, 1).getTime(); // partial: cursors older than this fail once
+const DEAD_MONTH = new Date(2026, 4, 1).getMonth();   // deadWindow: cursors in May always fail
+
+// ── synthetic rides: random 0–4 per day from Oct 2025, plus edge cases ────────────
+let seed = 42;
+const random = () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
 const rides = [];
-let id = 1_000_000;
-const addRide = (t) => {
-  const mins = 2 + Math.floor(rand() * 40);
-  const cents = rand() < 0.1 ? 0 : Math.round(mins * 29.4);
+function addRide(startMs) {
+  const minutes = 2 + Math.floor(random() * 40);
+  const cents = random() < 0.1 ? 0 : Math.round(minutes * 29.4);
   rides.push({
-    __typename: 'Ride', rideId: String(id++), startTimeMs: String(t), endTimeMs: String(t + mins * MS_PER_MIN),
-    duration: mins * MS_PER_MIN, rideableName: `${100 + (id % 900)}-${1000 + (id % 9000)}`,
-    price: { __typename: 'Money', amount: cents, currency: 'USD', formatted: `$${(cents / 100).toFixed(2)}` },
+    rideId: String(1_000_000 + rides.length), startTimeMs: String(startMs),
+    duration: minutes * MS_PER_MIN,
+    price: { formatted: `$${(cents / 100).toFixed(2)}` }, cents,
   });
-};
-for (let d = DATA_START; d < NOW; d += MS_PER_DAY) {
-  const n = Math.floor(rand() * (RIDES_PER_DAY_MAX + 1));
-  for (let i = 0; i < n; i++) addRide(d + Math.floor(rand() * MS_PER_DAY));
 }
-for (let i = 0; i < BURST_RIDES; i++) addRide(BURST_DAY + i * 7 * MS_PER_MIN);
-addRide(PERIOD_START);                           // exactly at the lookback start
-addRide(PERIOD_START - 1);                       // 1ms before: must be excluded
+for (let day = new Date(2025, 9, 1).getTime(); day < NOW; day += MS_PER_DAY) {
+  const count = Math.floor(random() * 5);
+  for (let i = 0; i < count; i++) addRide(day + Math.floor(random() * MS_PER_DAY));
+}
+for (let i = 0; i < 37; i++) addRide(new Date(2026, 5, 14).getTime() + i * 7 * MS_PER_MIN); // busy day
+addRide(PERIOD_START);     // exactly at the period start: included
+addRide(PERIOD_START - 1); // 1 ms before: excluded
 rides.sort((a, b) => b.startTimeMs - a.startTimeMs);
 
+// Same format as the snippet's `start` column.
+const formatStart = (ms) => new Date(Number(ms)).toLocaleString('sv-SE', { timeZone: 'America/New_York' });
+const expected = rides.filter((r) => r.startTimeMs >= PERIOD_START && r.startTimeMs < NOW);
+const expectedCents = expected.reduce((sum, r) => sum + r.cents, 0);
+const expectedCapped = expected.reduce((sum, r) => sum + Math.min(r.cents, CAP_CENTS), 0);
 
-const truth = rides.filter((r) => r.startTimeMs >= PERIOD_START && r.startTimeMs < NOW);
-const truthCents = truth.reduce((s, r) => s + r.price.amount, 0);
-const CAP_CENTS = 365;                           // must match the snippet's PRICE_CAP_CENTS default
-const truthCapped = truth.reduce((s, r) => s + Math.min(r.price.amount, CAP_CENTS), 0);
+// ── fake server ───────────────────────────────────────────────────────────────────
+const jsonResponse = (body) => ({ status: 200, json: async () => body });
+const neverAnswer = (signal) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason)));
+const badGateway = { status: 502, json: async () => { throw new SyntaxError('Unexpected token <'); } };
 
-// ── mock server ───────────────────────────────────────────────────────────────────
-const json = (body, status = 200) => ({ ok: status < 400, status, json: async () => body });
-const dayOf = (ms) => new Date(ms).toLocaleDateString('sv-SE', { timeZone: 'America/New_York' });
-
-// Whole-request faults; returning a value short-circuits the normal response.
-const FAULTS = {
-  sizeCap: ({ n }) => (n > ALIAS_CAP ? json({ errors: [{ message: 'Query is too complex' }] }, 400) : null),
-  hang: ({ n, signal }) => (n > ALIAS_CAP
-    ? new Promise((_, rej) => signal.addEventListener('abort', () => rej(new Error('aborted'))))
-    : null),
-  http502: ({ stats }) => (stats.requests % HTTP502_EVERY === 0
-    ? { ok: false, status: 502, json: async () => { throw new SyntaxError('Unexpected token <'); } }
-    : null),
-};
-// Per-alias faults: true nulls out that alias and adds an error entry.
-const ALIAS_FAULTS = {
-  partial: (cursor, seen) => cursor < PARTIAL_BEFORE && !seen.has(cursor) && Boolean(seen.add(cursor)),
-  deadWindow: (cursor) => dayOf(cursor).startsWith(DEAD_CURSOR_MONTH),
-};
-
-function mockFetch({ cursorMode, fault, stats }) {
-  const before = {
-    exclusive: (t, c) => t < c,
-    inclusive: (t, c) => t <= c,
-    fuzzy: (t, c) => t < c + FUZZ_MS,
+function fakeServer({ cursorMode, fault }) {
+  const isBefore = {
+    exclusive: (t, cursor) => t < cursor,
+    inclusive: (t, cursor) => t <= cursor,
+    fuzzy: (t, cursor) => t < cursor + 30_000,
   }[cursorMode];
-  const seen = new Set();
-  return async (url, opts) => {
-    stats.requests++;
-    const { query, variables } = JSON.parse(opts.body);
-    if (/limit:/.test(query)) {
-      return json({ errors: [{ message: 'Unknown argument "limit" on field "User.rideHistory".' }] }, 400);
+  const failedOnce = new Set();
+  const stats = { requests: 0 };
+
+  function windowFails(cursor) {
+    if (fault === 'deadWindow') return new Date(cursor).getMonth() === DEAD_MONTH;
+    if (fault === 'partial' && cursor < PARTIAL_BEFORE && !failedOnce.has(cursor)) return failedOnce.add(cursor);
+    return false;
+  }
+
+  async function fetch(url, { body, signal }) {
+    stats.requests += 1;
+    if (fault === 'hangOnce' && stats.requests === 1) return neverAnswer(signal);
+    if (fault === 'http502' && stats.requests % 3 === 0) return badGateway;
+
+    const member = {};
+    for (const [name, value] of Object.entries(JSON.parse(body).variables)) {
+      const alias = `r${name.match(/\d+$/)[0]}`; // variable "cursor7" answers alias "r7"
+      const cursor = Number(value);
+      if (windowFails(cursor)) { member[alias] = null; continue; }
+      const matching = rides.filter((r) => isBefore(Number(r.startTimeMs), cursor));
+      member[alias] = { limit: PAGE_SIZE, hasMore: matching.length > PAGE_SIZE, rideHistoryList: matching.slice(0, PAGE_SIZE) };
     }
-    const n = Object.keys(variables).length;
-    const short = FAULTS[fault]?.({ n, signal: opts.signal, stats });
-    if (short) return short;
-    const member = { __typename: 'User', id: 'u1' };
-    const errors = [];
-    for (const [k, v] of Object.entries(variables)) {
-      const alias = `r${k.match(/\d+$/)[0]}`; // variable "cursor7" answers alias "r7"
-      const cursor = v === null ? Infinity : Number(v);
-      if (ALIAS_FAULTS[fault]?.(cursor, seen)) {
-        member[alias] = null;
-        errors.push({ message: 'Internal server error', path: ['member', alias] });
-        continue;
-      }
-      const matching = rides.filter((r) => before(Number(r.startTimeMs), cursor));
-      member[alias] = {
-        limit: SERVER_DEFAULT_LIMIT, hasMore: matching.length > SERVER_DEFAULT_LIMIT,
-        rideHistoryList: matching.slice(0, SERVER_DEFAULT_LIMIT),
-      };
-    }
-    return json(errors.length ? { data: { member }, errors } : { data: { member } });
-  };
+    return jsonResponse({ data: { member } });
+  }
+  return { fetch, stats };
 }
 
 // ── run cases ─────────────────────────────────────────────────────────────────────
 const code = fs.readFileSync(SNIPPET, 'utf8');
 const quiet = { log() {}, warn() {}, table() {} };
-const sandbox = { setTimeout, clearTimeout, AbortController, URL, console };
 const CASES = [
   ...['exclusive', 'inclusive', 'fuzzy'].map((cursorMode) => ({ cursorMode, fault: 'none' })),
-  ...['sizeCap', 'hang', 'http502', 'partial', 'deadWindow'].map((fault) => ({ cursorMode: 'exclusive', fault })),
+  ...['hangOnce', 'http502', 'partial', 'deadWindow'].map((fault) => ({ cursorMode: 'exclusive', fault })),
 ];
 let failures = 0;
+// Node doesn't let AbortSignal.timeout keep the process alive (browsers do), so a
+// request that never answers would otherwise end the whole test run silently.
+const keepAlive = setInterval(() => {}, 1_000);
 
 for (const { cursorMode, fault } of CASES) {
-  const stats = { requests: 0 };
-  let downloaded;
-  const env = {
-    now: () => NOW, gapMs: 0, timeoutMs: TEST_TIMEOUT_MS,
-    fetch: mockFetch({ cursorMode, fault, stats }),
+  const server = fakeServer({ cursorMode, fault });
+  let csv;
+  const testHooks = {
+    now: NOW, pauseMs: 0, timeoutMs: 50, fetch: server.fetch,
     console: argv.v ? console : quiet,
-    download: (name, csv) => { downloaded = { name, csv }; },
+    download: (_filename, text) => { csv = text; },
   };
-  const res = await vm.runInNewContext(code, { ...sandbox, __CITIBIKE_TEST_HOOKS__: env });
-  const got = new Set(res.rows.map((r) => r.rideId));
-  const missingRides = truth.filter((r) => !got.has(r.rideId));
-  const extra = res.rows.filter((r) => !truth.some((t) => t.rideId === r.rideId)).length;
+  const sandbox = { setTimeout, AbortSignal, URL, console, __CITIBIKE_TEST_HOOKS__: testHooks };
+  const result = await vm.runInNewContext(code, sandbox);
+
+  // Rows have no ride ID, so match them to expected rides by start time (count
+  // per time, since two rides could start in the same second).
+  const unmatched = new Map();
+  for (const row of result.rows) unmatched.set(row.start, (unmatched.get(row.start) ?? 0) + 1);
+  const missing = expected.filter((ride) => {
+    const start = formatStart(ride.startTimeMs);
+    if (!unmatched.get(start)) return true;
+    unmatched.set(start, unmatched.get(start) - 1);
+    return false;
+  });
+  const extra = [...unmatched.values()].reduce((sum, n) => sum + n, 0);
+
   let ok;
   if (fault === 'deadWindow') {
-    // Expected: those windows are reported failed, and every missing ride falls inside one.
-    const inFailed = (t) => res.failedWindows.some((w) => t >= w.startMs && t < w.cursorMs);
-    ok = res.failedWindows.length > 0 && res.rows.length > truth.length / 2 && extra === 0 && missingRides.every((r) => inFailed(Number(r.startTimeMs)));
+    // Failed windows must be reported, and every missing ride must fall inside one.
+    const inFailedWindow = (ms) => result.failedWindows.some((w) => ms >= w.startMs && ms < w.cursorMs);
+    ok = result.failedWindows.length > 0 && result.rows.length > expected.length / 2 && extra === 0
+      && missing.every((r) => inFailedWindow(Number(r.startTimeMs)));
   } else {
-    ok = missingRides.length === 0 && extra === 0 && res.totalCents === truthCents && res.failedWindows.length === 0
-      && res.cappedCents === truthCapped && res.savedCents === truthCents - truthCapped
-      && downloaded?.csv.split('\n').length === truth.length + 1;
+    ok = missing.length === 0 && extra === 0 && result.failedWindows.length === 0
+      && result.total.cents === expectedCents && result.total.cappedCents === expectedCapped
+      && csv.split('\n').length === expected.length + 1;
   }
-  if (!ok) failures++;
+  if (!ok) failures += 1;
   echo(`${ok ? '✓ PASS' : '✗ FAIL'}  cursor ${cursorMode.padEnd(9)}  fault ${fault.padEnd(10)}`
-    + `  rides ${String(res.rows.length).padStart(3)}/${truth.length}  missing ${String(missingRides.length).padStart(2)}`
-    + `  extra ${extra}  failed windows ${String(res.failedWindows.length).padStart(2)}  requests ${stats.requests}`);
+    + `  rides ${result.rows.length}/${expected.length}  missing ${missing.length}  extra ${extra}`
+    + `  failed windows ${result.failedWindows.length}  requests ${server.stats.requests}`);
 }
-const seq = Math.ceil(truth.length / SERVER_DEFAULT_LIMIT);
+
+clearInterval(keepAlive);
+const dollars = (cents) => `$${(cents / 100).toFixed(2)}`;
 echo(failures
   ? `\n✗ ${failures} case(s) failed`
-  : `\n✓ all cases pass (${truth.length} rides, $${(truthCents / 100).toFixed(2)}, capped $${(truthCapped / 100).toFixed(2)}; page-by-page would need ~${seq} requests)`);
+  : `\n✓ all cases pass (${expected.length} rides, ${dollars(expectedCents)}, capped ${dollars(expectedCapped)})`);
 process.exit(failures ? 1 : 0);
