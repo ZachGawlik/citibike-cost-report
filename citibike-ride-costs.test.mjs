@@ -2,8 +2,8 @@
 // Runs citibike-ride-costs.js against a fake GraphQL server; see --help.
 import vm from 'node:vm';
 
-const HELP = `usage: test-ride-costs.mjs [-v]
-       test-ride-costs.mjs --help | -h | help
+const HELP = `usage: citibike-ride-costs.test.mjs [-v]
+       citibike-ride-costs.test.mjs --help | -h | help
 
 Runs citibike-ride-costs.js in a vm against a fake /bikesharefe-gql server with
 synthetic rides, and checks the exported rides and totals exactly match.

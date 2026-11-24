@@ -37,7 +37,7 @@ same few requests.
 ## Tests
 
 ```sh
-./test-ride-costs.mjs       # needs zx; -v shows the snippet's output
+./citibike-ride-costs.test.mjs   # needs zx; -v shows the snippet's output
 ```
 
 The test runs the snippet in a Node `vm` against a fake server with synthetic
