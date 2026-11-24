@@ -64,12 +64,18 @@ totals, for poking at further (e.g. `citibikeRides.total`).
 
 ## Settings
 
-The constants at the top of `citibike-ride-costs.js` are the knobs:
+What to export is set at the top of `citibike-ride-costs.js`:
 
 | constant              | default | what it does |
 |-----------------------|---------|--------------|
 | `LOOKBACK_DAYS`       | `365`   | how far back to fetch |
 | `PRICE_CAP_CENTS`     | `365`   | the hypothetical per-ride cap ($3.65) |
+
+How rides are fetched is set inside `fetchAllRides()`, in the "Fetching" section
+at the bottom of the file:
+
+| constant              | default | what it does |
+|-----------------------|---------|--------------|
 | `WINDOW_DAYS`         | `4`     | date span per lookup window |
 | `WINDOWS_PER_REQUEST` | `30`    | windows asked for in one request; lower it if requests start failing as "too complex" |
 | `MAX_REQUESTS`        | `100`   | safety stop |
