@@ -49,7 +49,6 @@
       start: formatDateTime(ride.startTimeMs),
       minutes: Math.round(ride.duration / 60_000),
       cents,
-      cappedCents: Math.min(cents, PRICE_CAP_CENTS),
     };
   }
 
@@ -62,7 +61,7 @@
         totals.rides += 1;
         totals.overCap += row.cents > PRICE_CAP_CENTS ? 1 : 0;
         totals.cents += row.cents;
-        totals.cappedCents += row.cappedCents;
+        totals.cappedCents += Math.min(row.cents, PRICE_CAP_CENTS);
       }
     }
     return { byMonth, total };
@@ -70,15 +69,15 @@
 
   function printReport({ byMonth, total }, requestCount, failedWindows) {
     const tableRow = (t) => ({
-      rides: t.rides,
-      total: formatDollars(t.cents),
-      [`rides > ${formatDollars(PRICE_CAP_CENTS)}`]: t.overCap,
-      'capped total': formatDollars(t.cappedCents),
-      saved: formatDollars(t.cents - t.cappedCents),
+      '# rides': t.rides,
+      '# rides above cap': t.overCap,
+      '$ spent': formatDollars(t.cents),
+      '$ if capped': formatDollars(t.cappedCents),
+      '$ would save': formatDollars(t.cents - t.cappedCents),
     });
     const table = {};
     for (const [month, totals] of Object.entries(byMonth)) table[month] = tableRow(totals);
-    table.total = tableRow(total);
+    table[`total for last ${LOOKBACK_DAYS} days`] = tableRow(total);
     console.table(table);
     console.log(`${total.rides} rides in the last ${LOOKBACK_DAYS} days, ${requestCount} requests`);
     if (failedWindows.length > 0) {

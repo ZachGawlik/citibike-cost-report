@@ -36,15 +36,16 @@ Unfortunately, for-profit tech companies increasingly lock down your data rather
 
 ## What you get
 
-**A table** with one row per month, plus a `total` row at the bottom:
+**A table** with one row per month, plus a `total for last 365 days` row at
+the bottom:
 
-| column          | meaning                                          |
-|-----------------|--------------------------------------------------|
-| `rides`         | how many rides started that month                |
-| `total`         | what you actually paid                           |
-| `rides > $3.65` | how many rides cost more than $3.65              |
-| `capped total`  | what you'd have paid if no ride cost over $3.65  |
-| `saved`         | the difference between the two                   |
+| column              | meaning                                                |
+|---------------------|--------------------------------------------------------|
+| `# rides`           | how many rides started that month                      |
+| `# rides above cap` | how many rides cost more than $3.65                    |
+| `$ spent`           | what you actually paid                                 |
+| `$ if capped`       | what you would have paid if rides were capped to $3.65 |
+| `$ would save`      | the difference between the two                         |
 
 The first and last months only cover part of the month, because the period is
 exactly the last 365 days.
@@ -57,7 +58,6 @@ first:
 | `start`       | `2026-11-20 16:27:14` | when the ride started (New York time) |
 | `minutes`     | `6`                   | how long it lasted               |
 | `cents`       | `176`                 | what it cost, in cents ($1.76)   |
-| `cappedCents` | `176`                 | what it would cost with the cap  |
 
 ## Technical details
 
