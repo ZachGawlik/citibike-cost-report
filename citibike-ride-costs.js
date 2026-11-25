@@ -15,6 +15,7 @@
   const PRICE_CAP_CENTS = 365;                  // upcoming ride fare cap, https://citibikenyc.com/memberebikecap
   const TIME_ZONE = 'America/New_York';         // for ride times and month grouping
   const MS_PER_DAY = 86_400_000;
+  const MUTED_STYLE = 'color: gray';           // DevTools %c style for progress logs
 
   // ── Helpers ─────────────────────────────────────────────────────────────────────
 
@@ -77,9 +78,8 @@
     });
     const table = {};
     for (const [month, totals] of Object.entries(byMonth)) table[month] = tableRow(totals);
-    table[`total for last ${LOOKBACK_DAYS} days`] = tableRow(total);
+    table[`total of last ${LOOKBACK_DAYS} days`] = tableRow(total);
     console.table(table);
-    console.log(`${total.rides} rides in the last ${LOOKBACK_DAYS} days, ${requestCount} requests`);
     if (failedWindows.length > 0) {
       console.warn(`✗ INCOMPLETE: ${failedWindows.length} windows failed; totals are missing their rides`);
     }
@@ -96,6 +96,8 @@
   const periodEnd = Date.now();
   const periodStart = periodEnd - LOOKBACK_DAYS * MS_PER_DAY;
 
+  // Progress logs go in a collapsed group; failures are summarized after the table.
+  console.groupCollapsed(`%cfetching ${LOOKBACK_DAYS} days of rides…`, MUTED_STYLE);
   const { items: rides, requestCount, failedWindows } = await collectByTimeWindows({
     start: periodStart,
     end: periodEnd,
@@ -108,12 +110,13 @@
     maxRequests: 100,         // safety stop; a normal year needs ~5–10
     pauseMs: 300,             // between requests, to be polite
   });
+  console.groupEnd();
   const rows = rides.sort((a, b) => a.startTimeMs - b.startTimeMs).map(toRow); // oldest first
   const summary = summarize(rows);
   printReport(summary, requestCount, failedWindows);
 
   globalThis.citibikeRides = { rows, csv: toCsv(rows), ...summary, requestCount, failedWindows };
-  console.log('To copy the rides as CSV to your clipboard, run:  copy(citibikeRides.csv)');
+  console.log('A per-ride CSV of the underlying data can be copied to your clipboard by running `copy(citibikeRides.csv)` in this console');
 
 
   // ── Citi Bike requests ──────────────────────────────────────────────────────────
@@ -212,7 +215,7 @@
       }
       const batch = queue.splice(0, batchSize);
       requestCount += 1;
-      console.log(`request ${requestCount}: ${batch.length} windows, ${items.size} items so far`);
+      console.log(`%crequest ${requestCount}: ${batch.length} windows, ${items.size} items so far`, MUTED_STYLE);
 
       let pages;
       try {

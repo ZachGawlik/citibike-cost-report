@@ -108,7 +108,7 @@ function fakeServer({ cursorMode, fault }) {
 
 // ── run cases ─────────────────────────────────────────────────────────────────────
 const code = fs.readFileSync(SNIPPET, 'utf8');
-const quiet = { log() {}, warn() {}, table() {} };
+const quiet = { log() {}, warn() {}, table() {}, groupCollapsed() {}, groupEnd() {} };
 /** Date whose "now" is fixed at NOW; everything else behaves like Date. */
 class FrozenDate extends Date {
   static now() { return NOW; }
