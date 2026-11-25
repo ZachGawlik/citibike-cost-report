@@ -4,8 +4,8 @@ Citi Bike rides in NYC/NJ will get capped to $3.65 starting January 19, 2027. ht
 
 This code calculates a report of how much money this fare cap would have saved you over your past year of Citi Bike usage.
 
-Here's my own run, as of November 11, 2026:
-![Screenshot of my personal CitiBike ride-history screen. The browser DevTools are open, with this repo's script pasted in and the resulting console output displaying a monthly table and year total of my last year's of CitiBike ride counts, spending, and cost savings if each ride were capped to $3.65](./example-output-browser.png)
+Here's my own run, as of November 25, 2026:
+![Screenshot of my personal CitiBike ride-history screen. The browser DevTools are open, with this repo's script pasted in and the resulting console output displaying a monthly table and year total of my last year's of CitiBike ride counts, spending, and cost savings if each ride were capped to $3.65. I spent $538.93 over the last 365 days and would have saved $37.94 if the fare capping had been in place.](./example-run-20261125.png)
 
 ## How to use it
 
@@ -14,11 +14,9 @@ Here's my own run, as of November 11, 2026:
    anywhere on the page and select "Inspect". Click the "Console" tab of the pane.
 3. Copy the whole contents of `citibike-ride-costs.js`, paste it into the console's input and
    press Enter.
-4. Wait a few seconds while it fetches your rides. You'll see a few
-   `request …` lines, then a table of results.
-5. To get the full list of rides, type `copy(citibikeRides.csv)` into the
-   console and press Enter. That puts it on your clipboard as CSV, which you
-   can paste into a spreadsheet (Google Sheets, Excel, Numbers).
+4. Wait a few seconds while it fetches your rides. It will then display a table of your monthly usage and potential cost-savings.
+5. Optionally, to get your full list of underlying ride data, type `copy(citibikeRides.csv)` into the
+   console and press Enter. This CSV data can be copied into a file and/or pasted into a spreadsheet application.
 
 ## Is it safe?
 
@@ -33,31 +31,6 @@ This script essentially runs the same underlying data fetches as many "Show More
 
 It would be very easy for Citi Bike to offer a native way to retrieve your full ride history.
 Unfortunately, for-profit tech companies increasingly lock down your data rather than empowering you to review it yourself.
-
-## What you get
-
-**A table** with one row per month, plus a `total for last 365 days` row at
-the bottom:
-
-| column              | meaning                                                |
-|---------------------|--------------------------------------------------------|
-| `# rides`           | how many rides started that month                      |
-| `# rides above cap` | how many rides cost more than $3.65                    |
-| `$ spent`           | what you actually paid                                 |
-| `$ if capped`       | what you would have paid if rides were capped to $3.65 |
-| `$ would save`      | the difference between the two                         |
-
-The first and last months only cover part of the month, because the period is
-exactly the last 365 days.
-
-**The ride list** (from `copy(citibikeRides.csv)`), one ride per line, oldest
-first:
-
-| column        | example               | meaning                          |
-|---------------|-----------------------|----------------------------------|
-| `start`       | `2026-11-20 16:27:14` | when the ride started (New York time) |
-| `minutes`     | `6`                   | how long it lasted               |
-| `cents`       | `176`                 | what it cost, in cents ($1.76)   |
 
 ## Technical details
 
